@@ -26,13 +26,9 @@ struct Args {
   #[arg(short, long, default_value_t = String::from("/etc/split/split.conf"))]
   conf: String,
 
-  /// port to listen
-  #[arg(short, long, default_value_t = String::from("80"))]
-  port: String,
-
-  /// host to listen
-  #[arg(short, long, default_value_t = String::from("0.0.0.0"))]
-  host: String,
+  /// addr to listen
+  #[arg(short, long, value_delimiter = ' ', default_values = ["0.0.0.0:80", "0.0.0.0:443"])]
+  addr: Option<Vec<String>>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -167,17 +163,27 @@ fn handle_request(mut stream: TcpStream, keys: &Arc<RwLock<Vec<String>>>, config
   stream.shutdown(Shutdown::Both).unwrap()
 }
 
-fn start(host: &str, port: &str, keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<HashMap<String, String>>>) {
-  let listener = TcpListener::bind(format!("{host}:{port}")).unwrap();
-  println!("{}", format!("Currently listening on {host}:{port}"));
+fn start(args: &Args, keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<HashMap<String, String>>>) {
+  let mut listeners = Vec::<TcpListener>::new();
+  for host in args.addr.clone().unwrap() {
+    listeners.push(TcpListener::bind(&host).unwrap());
+    println!("{}", format!("Currently listening on {host}"));
+  }
 
-  for stream in listener.incoming() {
-    let stream = stream.unwrap();
+  for listener in listeners {
     let keys = Arc::clone(&keys);
     let config = Arc::clone(&config);
-    thread::spawn(move || {
-      handle_request(stream, &keys, &config);
+    let thread = thread::spawn(move || {
+      for stream in listener.incoming() {
+        let stream = stream.unwrap();
+        let keys = Arc::clone(&keys);
+        let config = Arc::clone(&config);
+        thread::spawn(move || {
+          handle_request(stream, &keys, &config);
+        });
+      }
     });
+    thread.join().expect("Cannot join thread");
   }
 }
 
@@ -208,6 +214,7 @@ fn main() {
       {
         let keys = Arc::clone(&keys);
         let config = Arc::clone(&config);
+        let conf_file = args.conf.clone();
         let mut signals = Signals::new(&[SIGTERM, SIGHUP]).unwrap();
         thread::spawn(move || {
           for sig in signals.forever() {
@@ -220,7 +227,7 @@ fn main() {
               }
               SIGHUP => {
                 println!("reloading configuration…");
-                get_config(&keys, &config, &args.conf);
+                get_config(&keys, &config, &conf_file);
                 println!("Successfully reloaded configuration.");
               }
               _ => (),
@@ -229,7 +236,7 @@ fn main() {
         });
       }
 
-      start(&args.host, &args.port, &keys, &config);
+      start(&args, &keys, &config);
     }
 
     Commands::Stop => {
