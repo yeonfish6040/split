@@ -6,17 +6,18 @@ use std::sync::{Arc, RwLock};
 use std::thread;
 
 use clap::{Parser, Subcommand};
-use clap::builder::Str;
 use daemonize::Daemonize;
 use signal_hook::consts::{SIGHUP, SIGTERM};
 use signal_hook::iterator::Signals;
 
-const HOST: &str = "0.0.0.0";
-const PORT: &str = "80";
-
 #[derive(Parser, Debug)]
+#[clap(disable_help_flag = true)]
 #[command(version, about, long_about = None)]
 struct Args {
+  /// prints this page
+  #[clap(long, action = clap::ArgAction::HelpLong)]
+  help: Option<bool>,
+
   /// decide the action
   #[command(subcommand)]
   command: Commands,
@@ -24,6 +25,14 @@ struct Args {
   /// configuration file location
   #[arg(short, long, default_value_t = String::from("/etc/split/split.conf"))]
   conf: String,
+
+  /// port to listen
+  #[arg(short, long, default_value_t = String::from("80"))]
+  port: String,
+
+  /// host to listen
+  #[arg(short, long, default_value_t = String::from("0.0.0.0"))]
+  host: String,
 }
 
 #[derive(Subcommand, Debug)]
@@ -34,10 +43,6 @@ enum Commands {
   Stop,
   /// reload daemon
   Reload,
-}
-
-enum ConfigOptions {
-  RProxy, Static, DisableHttps, Response
 }
 
 // utils
@@ -60,7 +65,7 @@ fn get_pid() -> i32 {
   }
 }
 
-fn get_config(config: &Arc<RwLock<HashMap<String, String>>>, keys: &Arc<RwLock<Vec<String>>>, path: &str) {
+fn get_config(keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<HashMap<String, String>>>, path: &str) {
   let mut config_lock = config.write().unwrap();
   let mut keys_lock = keys.write().unwrap();
 
@@ -133,7 +138,7 @@ fn get_config(config: &Arc<RwLock<HashMap<String, String>>>, keys: &Arc<RwLock<V
           _ => {
             if arg_tmp.as_str() == "disable-https" { config_lock.insert(format!("{key}_https"), String::from("0")); }
             if arg_tmp.as_str() == "disable-verification" { config_lock.insert(format!("{key}_verification"), String::from("0")); }
-            println!("{}", arg_tmp);
+            // println!("{}", arg_tmp);
           }
         }
       }
@@ -141,11 +146,11 @@ fn get_config(config: &Arc<RwLock<HashMap<String, String>>>, keys: &Arc<RwLock<V
     }
     // println!("{}, {}", i + 1, el);
   }
-  println!("{:?}", config_lock.iter().collect::<Vec<_>>());
+  // println!("{:?}", config_lock.iter().collect::<Vec<_>>());
 }
 
 // functionality
-fn handle_request(mut stream: TcpStream) {
+fn handle_request(mut stream: TcpStream, keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<HashMap<String, String>>>) {
   let mut buffer = Vec::<u8>::new();
 
   let size: usize = stream.read_to_end(&mut buffer).unwrap();
@@ -162,14 +167,16 @@ fn handle_request(mut stream: TcpStream) {
   stream.shutdown(Shutdown::Both).unwrap()
 }
 
-fn start() {
-  let listener = TcpListener::bind(format!("{HOST}:{PORT}")).unwrap();
-  println!("{}", format!("Currently listening on port {PORT}"));
+fn start(host: &str, port: &str, keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<HashMap<String, String>>>) {
+  let listener = TcpListener::bind(format!("{host}:{port}")).unwrap();
+  println!("{}", format!("Currently listening on {host}:{port}"));
 
   for stream in listener.incoming() {
     let stream = stream.unwrap();
-    thread::spawn(|| {
-      handle_request(stream);
+    let keys = Arc::clone(&keys);
+    let config = Arc::clone(&config);
+    thread::spawn(move || {
+      handle_request(stream, &keys, &config);
     });
   }
 }
@@ -181,12 +188,12 @@ fn main() {
 
   match args.command {
     Commands::Start => {
-      get_config(&config, &keys, &args.conf);
+      get_config(&keys, &config, &args.conf);
 
       // demonize
       let daemon = Daemonize::new()
         .pid_file("/var/run/split.pid")
-        .working_directory("/etc/split") // 원하는 워킹 디렉터리
+        .working_directory("/etc/split")
         .stdout(std::fs::File::create("/var/log/split.out").unwrap())
         .stderr(std::fs::File::create("/var/log/split.err").unwrap());
       println!("started daemon");
@@ -198,26 +205,31 @@ fn main() {
       }
 
       // signal listener
-      let mut signals = Signals::new(&[SIGTERM, SIGHUP]).unwrap();
-      thread::spawn(move || {
-        for sig in signals.forever() {
-          match sig {
-            SIGTERM => {
-              std::fs::remove_file("/var/run/split.pid")
-                .expect("Error: Cannot delete pid file.");
-              println!("Received SIGTERM. Exiting.");
-              std::process::exit(0);
+      {
+        let keys = Arc::clone(&keys);
+        let config = Arc::clone(&config);
+        let mut signals = Signals::new(&[SIGTERM, SIGHUP]).unwrap();
+        thread::spawn(move || {
+          for sig in signals.forever() {
+            match sig {
+              SIGTERM => {
+                std::fs::remove_file("/var/run/split.pid")
+                    .expect("Error: Cannot delete pid file.");
+                println!("Received SIGTERM. Exiting.");
+                std::process::exit(0);
+              }
+              SIGHUP => {
+                println!("reloading configuration…");
+                get_config(&keys, &config, &args.conf);
+                println!("Successfully reloaded configuration.");
+              }
+              _ => (),
             }
-            SIGHUP => {
-              println!("reloading configuration…");
-              get_config(&config, &keys, &args.conf);
-            }
-            _ => (),
           }
-        }
-      });
+        });
+      }
 
-      start();
+      start(&args.host, &args.port, &keys, &config);
     }
 
     Commands::Stop => {
@@ -233,6 +245,5 @@ fn main() {
         .unwrap();
       println!("daemon reloaded");
     }
-    _ => {}
   }
 }
