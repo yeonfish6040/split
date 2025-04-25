@@ -43,6 +43,8 @@ enum Commands {
   /// stop daemon
   Stop,
   /// reload daemon
+  Restart,
+  /// reload daemon
   Reload,
 }
 
@@ -69,6 +71,8 @@ fn get_pid() -> i32 {
 fn get_config(keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<HashMap<String, String>>>, path: &str) {
   let mut config_lock = config.write().unwrap();
   let mut keys_lock = keys.write().unwrap();
+
+  config_lock.clear();
 
   let config_file = match std::fs::read_to_string(path) {
     Ok(d) => d,
@@ -161,6 +165,40 @@ fn handle_request(thread_count: Arc<RwLock<u64>>, mut stream: TcpStream, keys: &
     Err(e) => panic!("Invalid UTF-8 sequence: {}", e),
   };
 
+  let mut lines =  s.lines();
+  let path = lines.next().unwrap().split(" ").nth(1).unwrap();
+  let host = lines.find(|&x| x.starts_with("Host:")).unwrap().split(" ").nth(1).unwrap();
+
+  let target = {
+    let key_lock =  keys.read().unwrap();
+    let mut key_iter = key_lock.iter();
+
+    let search = key_iter.find(|&x| {
+      let host_tmp = x.split('/').next().unwrap_or(x);
+      if host_tmp.starts_with('*') {
+        // suffix
+        let suffix = &host_tmp[1..];
+        host.ends_with(suffix)
+      } else if host_tmp.ends_with('*') {
+        // prefix
+        let prefix = &host_tmp[..host_tmp.len()-1];
+        host.starts_with(prefix)
+      } else {
+        host == host_tmp
+      }
+    });
+
+    match search {
+      Some(d) => Ok(String::from(d)),
+      None => Err("Not found"),
+    }
+  };
+
+  match target {
+    Ok(d) => println!("found: {}", d),
+    Err(e) => println!("error: {}", e),
+  }
+
   println!("Peer: {}", stream.peer_addr().unwrap());
   stream.write(format!("{s}").as_bytes()).expect("ahhhhhhhh!");
   stream.flush().unwrap();
@@ -203,6 +241,51 @@ fn start(args: &Args, keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<HashM
   }
 }
 
+fn demonize(args: &Args, keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<HashMap<String, String>>>) {
+  get_config(&keys, &config, &args.conf);
+
+  // demonize
+  let daemon = Daemonize::new()
+      .pid_file("/var/run/split.pid")
+      .working_directory("/etc/split")
+      .stdout(std::fs::File::create("/var/log/split.out").unwrap())
+      .stderr(std::fs::File::create("/var/log/split.err").unwrap());
+  match daemon.start() {
+    Ok(_) => (),
+    Err(e) => {
+      println!("{:?}", e);
+    }
+  }
+
+  // signal listener
+  {
+    let keys = Arc::clone(&keys);
+    let config = Arc::clone(&config);
+    let conf_file = args.conf.clone();
+    let mut signals = Signals::new(&[SIGTERM, SIGHUP]).unwrap();
+    thread::spawn(move || {
+      for sig in signals.forever() {
+        match sig {
+          SIGTERM => {
+            std::fs::remove_file("/var/run/split.pid")
+                .expect("Error: Cannot delete pid file.");
+            println!("Received SIGTERM. Exiting.");
+            std::process::exit(0);
+          }
+          SIGHUP => {
+            println!("reloading configuration…");
+            get_config(&keys, &config, &conf_file);
+            println!("Successfully reloaded configuration.");
+          }
+          _ => (),
+        }
+      }
+    });
+  }
+
+  start(&args, &keys, &config);
+}
+
 fn main() {
   let args = Args::parse();
   let keys = Arc::new(RwLock::new(Vec::<String>::new()));
@@ -210,49 +293,8 @@ fn main() {
 
   match args.command {
     Commands::Start => {
-      get_config(&keys, &config, &args.conf);
-
-      // demonize
-      let daemon = Daemonize::new()
-        .pid_file("/var/run/split.pid")
-        .working_directory("/etc/split")
-        .stdout(std::fs::File::create("/var/log/split.out").unwrap())
-        .stderr(std::fs::File::create("/var/log/split.err").unwrap());
       println!("started daemon");
-      match daemon.start() {
-        Ok(_) => (),
-        Err(e) => {
-          println!("{:?}", e);
-        }
-      }
-
-      // signal listener
-      {
-        let keys = Arc::clone(&keys);
-        let config = Arc::clone(&config);
-        let conf_file = args.conf.clone();
-        let mut signals = Signals::new(&[SIGTERM, SIGHUP]).unwrap();
-        thread::spawn(move || {
-          for sig in signals.forever() {
-            match sig {
-              SIGTERM => {
-                std::fs::remove_file("/var/run/split.pid")
-                    .expect("Error: Cannot delete pid file.");
-                println!("Received SIGTERM. Exiting.");
-                std::process::exit(0);
-              }
-              SIGHUP => {
-                println!("reloading configuration…");
-                get_config(&keys, &config, &conf_file);
-                println!("Successfully reloaded configuration.");
-              }
-              _ => (),
-            }
-          }
-        });
-      }
-
-      start(&args, &keys, &config);
+      demonize(&args, &keys, &config);
     }
 
     Commands::Stop => {
@@ -267,6 +309,14 @@ fn main() {
       nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), nix::sys::signal::SIGHUP)
         .unwrap();
       println!("daemon reloaded");
+    }
+
+    Commands::Restart => {
+      let pid = get_pid();
+      nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), nix::sys::signal::SIGTERM)
+          .unwrap();
+      println!("restarted daemon");
+      demonize(&args, &keys, &config);
     }
   }
 }
