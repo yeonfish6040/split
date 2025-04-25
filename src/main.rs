@@ -5,6 +5,7 @@ use std::str;
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::thread::JoinHandle;
+use std::time::Duration;
 use clap::{Parser, Subcommand};
 use daemonize::Daemonize;
 use signal_hook::consts::{SIGHUP, SIGTERM};
@@ -29,6 +30,10 @@ struct Args {
   /// addr to listen
   #[arg(short, long, value_delimiter = ' ', default_values = ["0.0.0.0:80", "0.0.0.0:443"])]
   addr: Option<Vec<String>>,
+
+  /// max handler threads
+  #[arg(short, long, default_value_t = 1024)]
+  max: u64,
 }
 
 #[derive(Subcommand, Debug)]
@@ -146,7 +151,7 @@ fn get_config(keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<HashMap<Strin
 }
 
 // functionality
-fn handle_request(mut stream: TcpStream, keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<HashMap<String, String>>>) {
+fn handle_request(thread_count: Arc<RwLock<u64>>, mut stream: TcpStream, keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<HashMap<String, String>>>) {
   let mut buffer = [0u8; 16838];
 
   let size: usize = stream.read(&mut buffer).unwrap();
@@ -156,7 +161,7 @@ fn handle_request(mut stream: TcpStream, keys: &Arc<RwLock<Vec<String>>>, config
     Err(e) => panic!("Invalid UTF-8 sequence: {}", e),
   };
 
-  println!("Peer: {} | body: {}", stream.peer_addr().unwrap(), s);
+  println!("Peer: {}", stream.peer_addr().unwrap());
   stream.write(format!("{s}").as_bytes()).expect("ahhhhhhhh!");
   stream.flush().unwrap();
 
@@ -174,13 +179,20 @@ fn start(args: &Args, keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<HashM
   for listener in listeners {
     let keys = Arc::clone(&keys);
     let config = Arc::clone(&config);
+    let thread_count = Arc::new(RwLock::new(0u64));
+    let max_threads = args.max;
     let thread = thread::spawn(move || {
       for stream in listener.incoming() {
         let stream = stream.unwrap();
         let keys = Arc::clone(&keys);
         let config = Arc::clone(&config);
+        let thread_count = Arc::clone(&thread_count);
+
+        while thread_count.read().unwrap().ge(&max_threads) { thread::sleep(Duration::from_millis(1)); }
         thread::spawn(move || {
-          handle_request(stream, &keys, &config);
+          let thread_count_clone = Arc::clone(&thread_count);
+          { let mut cnt = thread_count_clone.write().unwrap(); *cnt += 1; }
+          handle_request(thread_count, stream, &keys, &config);
         });
       }
     });
