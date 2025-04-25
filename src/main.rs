@@ -93,9 +93,9 @@ fn get_config(keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<HashMap<Strin
       panic!("Error: Cannot parse symbol on line {i}.\n=> or <= not found on that line: {el}")
     }
     let parse = el.split("").collect::<Vec<&str>>();
+    let mut is_end_of_arg;
     let mut is_in_pair = false;
     let mut is_rslash_before = false;
-    let mut is_end_of_arg = false;
     let mut index = 0;
     let mut key = String::from("");
     let mut arg_tmp = String::from("");
