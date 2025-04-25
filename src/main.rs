@@ -5,7 +5,8 @@ use std::str;
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
+use chrono::{Local, Utc};
 use clap::{Parser, Subcommand};
 use daemonize::Daemonize;
 use signal_hook::consts::{SIGHUP, SIGTERM};
@@ -154,6 +155,22 @@ fn get_config(keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<HashMap<Strin
   // println!("{:?}", config_lock.iter().collect::<Vec<_>>());
 }
 
+fn build_packet(res_code: &str, res_msg: &str, body: &str) -> String {
+  let mut packet = String::from("");
+  packet.push_str(&format!("HTTP/1.1 {res_code} {res_msg}\n"));
+  packet.push_str("X-Powered-By: Split\n");
+  packet.push_str("Access-Control-Allow-Origin: *\n");
+  packet.push_str("Content-Type: text/html; charset=utf-8\n");
+  packet.push_str(&format!("Content-Length: {}\n", body.len()));
+  packet.push_str(&format!("Date: {}\n", Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string()));
+  packet.push_str("Connection: keep-alive\n");
+  packet.push_str("Keep-Alive: timeout=5\n");
+  packet.push_str("\n");
+  packet.push_str(body);
+
+  packet
+}
+
 // functionality
 fn handle_request(thread_count: Arc<RwLock<u64>>, mut stream: TcpStream, keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<HashMap<String, String>>>) {
   let mut buffer = [0u8; 16838];
@@ -168,6 +185,7 @@ fn handle_request(thread_count: Arc<RwLock<u64>>, mut stream: TcpStream, keys: &
   let mut lines =  s.lines();
   let path = lines.next().unwrap().split(" ").nth(1).unwrap();
   let host = lines.find(|&x| x.starts_with("Host:")).unwrap().split(" ").nth(1).unwrap();
+  print!("[LOG] {}{}   {} {}{}", Local::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(), Local::now().offset().to_string(), stream.peer_addr().unwrap(), host, path);
 
   let target = {
     let key_lock =  keys.read().unwrap();
@@ -195,15 +213,14 @@ fn handle_request(thread_count: Arc<RwLock<u64>>, mut stream: TcpStream, keys: &
   };
 
   match target {
-    Ok(d) => println!("found: {}", d),
-    Err(e) => println!("error: {}", e),
+    Ok(d) => {},
+    Err(e) => {
+      stream.write(build_packet("404", "Not Found", "Not Found").as_bytes()).expect("ahhhhhhhh!");
+    }
   }
 
-  println!("Peer: {}", stream.peer_addr().unwrap());
-  stream.write(format!("{s}").as_bytes()).expect("ahhhhhhhh!");
+  // stream.write(format!("{s}").as_bytes()).expect("ahhhhhhhh!");
   stream.flush().unwrap();
-
-  stream.shutdown(Shutdown::Both).unwrap()
 }
 
 fn start(args: &Args, keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<HashMap<String, String>>>) {
@@ -231,6 +248,7 @@ fn start(args: &Args, keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<HashM
           let thread_count_clone = Arc::clone(&thread_count);
           { let mut cnt = thread_count_clone.write().unwrap(); *cnt += 1; }
           handle_request(thread_count, stream, &keys, &config);
+          { let mut cnt = thread_count_clone.write().unwrap(); *cnt -= 1; }
         });
       }
     });
