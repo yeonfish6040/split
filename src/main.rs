@@ -188,7 +188,7 @@ fn start(args: &Args, keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<HashM
         let config = Arc::clone(&config);
         let thread_count = Arc::clone(&thread_count);
 
-        while thread_count.read().unwrap().ge(&max_threads) { thread::sleep(Duration::from_millis(1)); }
+        while thread_count.read().unwrap().ge(&max_threads) { thread::sleep(Duration::from_millis(10)); }
         thread::spawn(move || {
           let thread_count_clone = Arc::clone(&thread_count);
           { let mut cnt = thread_count_clone.write().unwrap(); *cnt += 1; }
