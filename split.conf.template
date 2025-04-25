@@ -1,0 +1,11 @@
+*.example.com => "http://localhost:3000"
+example.com => "http://localhost:80"
+example.com/admin => "http://localhost:8080"
+example.com/https => "https://localhost:8443/oh/shit/this/is/https/!/but/split/can/handle/this/shit"
+
+example.com/fakehttps => "https://localhost:1818/" disable-verification # disable ssl verification with the peer which behind of rproxy
+example.com/i/hate/https => "http://localhost:9999" disable-https # this disables https cert request from let's encrypt
+
+example.com/get/the/f/out/of/here <= "get out of here" # this returns string "get out of here"
+example.com/get/the/f/out/of/here/2222 <= "get out of here" res-404 # this returns string "get out of here" and http status code 404
+example.com/get/the/f/out/of/here/2222 <= "get out of here" res-404 disable-https # this returns string "get out of here" and http status code 404. and this disables https cert request from let's encrypt too
