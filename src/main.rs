@@ -4,7 +4,7 @@ use std::net::{Shutdown, TcpListener, TcpStream};
 use std::str;
 use std::sync::{Arc, RwLock};
 use std::thread;
-
+use std::thread::JoinHandle;
 use clap::{Parser, Subcommand};
 use daemonize::Daemonize;
 use signal_hook::consts::{SIGHUP, SIGTERM};
@@ -147,16 +147,16 @@ fn get_config(keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<HashMap<Strin
 
 // functionality
 fn handle_request(mut stream: TcpStream, keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<HashMap<String, String>>>) {
-  let mut buffer = Vec::<u8>::new();
+  let mut buffer = [0u8; 16838];
 
-  let size: usize = stream.read_to_end(&mut buffer).unwrap();
+  let size: usize = stream.read(&mut buffer).unwrap();
 
   let s = match str::from_utf8(&buffer[..size]) {
     Ok(v) => v,
     Err(e) => panic!("Invalid UTF-8 sequence: {}", e),
   };
 
-  println!("Peer: {}", stream.peer_addr().unwrap());
+  println!("Peer: {} | body: {}", stream.peer_addr().unwrap(), s);
   stream.write(format!("{s}").as_bytes()).expect("ahhhhhhhh!");
   stream.flush().unwrap();
 
@@ -170,6 +170,7 @@ fn start(args: &Args, keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<HashM
     println!("{}", format!("Currently listening on {host}"));
   }
 
+  let mut threads = Vec::<JoinHandle<()>>::new();
   for listener in listeners {
     let keys = Arc::clone(&keys);
     let config = Arc::clone(&config);
@@ -183,7 +184,10 @@ fn start(args: &Args, keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<HashM
         });
       }
     });
-    thread.join().expect("Cannot join thread");
+    threads.push(thread);
+  }
+  for thread in threads {
+    thread.join().expect("Cannot join thread.");
   }
 }
 
