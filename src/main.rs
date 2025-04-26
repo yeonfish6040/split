@@ -144,6 +144,8 @@ fn get_config(keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<HashMap<Strin
           _ => {
             if arg_tmp.as_str() == "disable-https" { config_lock.insert(format!("{key}_https"), String::from("0")); }
             if arg_tmp.as_str() == "disable-verification" { config_lock.insert(format!("{key}_verification"), String::from("0")); }
+            if arg_tmp.starts_with("res-") && config_lock.get("{key}_rproxy").unwrap().eq("1") { panic!("res symbol is only available for static response.") }
+            if arg_tmp.starts_with("res-") && config_lock.get("{key}_static").unwrap().eq("1") { config_lock.insert(format!("{key}_res"), String::from(arg_tmp.split("-").nth(1).unwrap())); }
             // println!("{}", arg_tmp);
           }
         }
@@ -185,7 +187,7 @@ fn handle_request(thread_count: Arc<RwLock<u64>>, mut stream: TcpStream, keys: &
   let mut lines =  s.lines();
   let path = lines.next().unwrap().split(" ").nth(1).unwrap();
   let host = lines.find(|&x| x.starts_with("Host:")).unwrap().split(" ").nth(1).unwrap();
-  print!("[LOG] {}{}   {} {}{}", Local::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(), Local::now().offset().to_string(), stream.peer_addr().unwrap(), host, path);
+  print!("[LOG] {}{}   {} {}{}\n", Local::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(), Local::now().offset().to_string(), stream.peer_addr().unwrap(), host, path);
 
   let target = {
     let key_lock =  keys.read().unwrap();
