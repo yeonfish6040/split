@@ -139,13 +139,13 @@ fn get_config(keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<HashMap<Strin
             }
           }
           3 => {
-            config_lock.insert(format!("{key}_target"), arg_tmp.clone());
+            config_lock.insert(format!("{key}_body"), arg_tmp.clone());
           }
           _ => {
             if arg_tmp.as_str() == "disable-https" { config_lock.insert(format!("{key}_https"), String::from("0")); }
             if arg_tmp.as_str() == "disable-verification" { config_lock.insert(format!("{key}_verification"), String::from("0")); }
-            if arg_tmp.starts_with("res-") && config_lock.get("{key}_rproxy").unwrap().eq("1") { panic!("res symbol is only available for static response.") }
-            if arg_tmp.starts_with("res-") && config_lock.get("{key}_static").unwrap().eq("1") { config_lock.insert(format!("{key}_res"), String::from(arg_tmp.split("-").nth(1).unwrap())); }
+            if arg_tmp.starts_with("res-") && config_lock.get(&format!("{key}_rproxy")).unwrap().eq("1") { panic!("res symbol is only available for static response.") }
+            if arg_tmp.starts_with("res-") && config_lock.get(&format!("{key}_static")).unwrap().eq("1") { config_lock.insert(format!("{key}_res"), String::from(arg_tmp.split("-").nth(1).unwrap())); }
             // println!("{}", arg_tmp);
           }
         }
@@ -173,8 +173,36 @@ fn build_packet(res_code: &str, res_msg: &str, body: &str) -> String {
   packet
 }
 
+fn get_matched_host_key<'a>(keys: &Arc<RwLock<Vec<String>>>, host: &str, path: &str) -> Result<String, &'a str> {
+  let key_lock =  keys.read().unwrap();
+  let mut key_iter = key_lock.iter();
+
+  let search = key_iter.find(|&x| {
+    let host_tmp = x.split('/').next().unwrap_or(x);
+    if host_tmp.starts_with('*') {
+      // suffix
+      let suffix = &host_tmp[1..];
+      host.ends_with(suffix)
+    } else if host_tmp.ends_with('*') {
+      // prefix
+      let prefix = &host_tmp[..host_tmp.len()-1];
+      host.starts_with(prefix)
+    } else {
+      host == host_tmp
+    }
+  });
+
+  match search {
+    Some(d) => {
+      if d.contains("/") && !path.starts_with(&d[d.find("/").unwrap()..]) { Err("Not found") }
+      else { Ok(String::from(d)) }
+    },
+    None => Err("Not found"),
+  }
+}
+
 // functionality
-fn handle_request(thread_count: Arc<RwLock<u64>>, mut stream: TcpStream, keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<HashMap<String, String>>>) {
+fn handle_request(mut stream: TcpStream, keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<HashMap<String, String>>>) {
   let mut buffer = [0u8; 16838];
 
   let size: usize = stream.read(&mut buffer).unwrap();
@@ -189,33 +217,14 @@ fn handle_request(thread_count: Arc<RwLock<u64>>, mut stream: TcpStream, keys: &
   let host = lines.find(|&x| x.starts_with("Host:")).unwrap().split(" ").nth(1).unwrap();
   print!("[LOG] {}{}   {} {}{}\n", Local::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(), Local::now().offset().to_string(), stream.peer_addr().unwrap(), host, path);
 
-  let target = {
-    let key_lock =  keys.read().unwrap();
-    let mut key_iter = key_lock.iter();
-
-    let search = key_iter.find(|&x| {
-      let host_tmp = x.split('/').next().unwrap_or(x);
-      if host_tmp.starts_with('*') {
-        // suffix
-        let suffix = &host_tmp[1..];
-        host.ends_with(suffix)
-      } else if host_tmp.ends_with('*') {
-        // prefix
-        let prefix = &host_tmp[..host_tmp.len()-1];
-        host.starts_with(prefix)
-      } else {
-        host == host_tmp
+  let target = get_matched_host_key(&keys, &host, &path);
+  match &target {
+    Ok(d) => {
+      let config_lock = config.read().unwrap();
+      if config_lock.get(&format!("{d}_static")).unwrap() == "1" {
+        stream.write(build_packet(config_lock.get(&format!("{d}_res")).unwrap(), "OK", config_lock.get(&format!("{d}_body")).unwrap()).as_bytes()).expect("ahhhhhhhh!");
       }
-    });
-
-    match search {
-      Some(d) => Ok(String::from(d)),
-      None => Err("Not found"),
-    }
-  };
-
-  match target {
-    Ok(d) => {},
+    },
     Err(e) => {
       stream.write(build_packet("404", "Not Found", "Not Found").as_bytes()).expect("ahhhhhhhh!");
     }
@@ -249,7 +258,7 @@ fn start(args: &Args, keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<HashM
         thread::spawn(move || {
           let thread_count_clone = Arc::clone(&thread_count);
           { let mut cnt = thread_count_clone.write().unwrap(); *cnt += 1; }
-          handle_request(thread_count, stream, &keys, &config);
+          handle_request(stream, &keys, &config);
           { let mut cnt = thread_count_clone.write().unwrap(); *cnt -= 1; }
         });
       }
