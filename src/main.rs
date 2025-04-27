@@ -1,11 +1,11 @@
 use std::collections::HashMap;
-use std::io::{ErrorKind, Read, Write};
-use std::net::{Shutdown, TcpListener, TcpStream};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::str;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, RwLockReadGuard};
 use std::thread;
 use std::thread::JoinHandle;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration};
 use chrono::{Local, Utc};
 use clap::{Parser, Subcommand};
 use daemonize::Daemonize;
@@ -69,7 +69,7 @@ fn get_pid() -> i32 {
   }
 }
 
-fn get_config(keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<HashMap<String, String>>>, path: &str) {
+fn fetch_config(keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<HashMap<String, String>>>, path: &str) {
   let mut config_lock = config.write().unwrap();
   let mut keys_lock = keys.write().unwrap();
 
@@ -139,7 +139,7 @@ fn get_config(keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<HashMap<Strin
             }
           }
           3 => {
-            config_lock.insert(format!("{key}_body"), arg_tmp.clone());
+            config_lock.insert(format!("{key}_target"), arg_tmp.clone());
           }
           _ => {
             if arg_tmp.as_str() == "disable-https" { config_lock.insert(format!("{key}_https"), String::from("0")); }
@@ -201,13 +201,30 @@ fn get_matched_host_key<'a>(keys: &Arc<RwLock<Vec<String>>>, host: &str, path: &
   }
 }
 
+fn get_config(config_lock: &RwLockReadGuard<HashMap<String, String>>, target: &str, key: &str) -> String {
+  String::from(config_lock.get(&format!("{target}_{key}")).unwrap())
+}
+
 // functionality
 fn handle_request(mut stream: TcpStream, keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<HashMap<String, String>>>) {
-  let mut buffer = [0u8; 16838];
+  let peer_addr = stream.peer_addr().unwrap();
 
-  let size: usize = stream.read(&mut buffer).unwrap();
+  let mut header_buf = Vec::new();
+  let mut packet_buf = Vec::new();
 
-  let s = match str::from_utf8(&buffer[..size]) {
+  let mut reader = BufReader::new(&mut stream);
+  loop {
+    let mut buffer = Vec::new();
+    reader.read_until(b'\n', &mut buffer).unwrap();
+    if buffer.is_empty() { panic!("Error: Stream closed before headers complete"); }
+
+    packet_buf.extend_from_slice(&buffer);
+    header_buf.extend_from_slice(&buffer);
+
+    if packet_buf.ends_with(b"\r\n\r\n") { break };
+  }
+
+  let s = match str::from_utf8(&header_buf) {
     Ok(v) => v,
     Err(e) => panic!("Invalid UTF-8 sequence: {}", e),
   };
@@ -215,22 +232,62 @@ fn handle_request(mut stream: TcpStream, keys: &Arc<RwLock<Vec<String>>>, config
   let mut lines =  s.lines();
   let path = lines.next().unwrap().split(" ").nth(1).unwrap();
   let host = lines.find(|&x| x.starts_with("Host:")).unwrap().split(" ").nth(1).unwrap();
-  print!("[LOG] {}{}   {} {}{}\n", Local::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(), Local::now().offset().to_string(), stream.peer_addr().unwrap(), host, path);
+  let content_length = lines.find(|&x| x.starts_with("Content-Length:")).unwrap_or(" 0").split(" ").nth(1).unwrap().parse::<usize>().unwrap_or(0);
+  print!("[LOG] {}{}   {} {}{}\n", Local::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(), Local::now().offset().to_string(), peer_addr, host, path);
 
   let target = get_matched_host_key(&keys, &host, &path);
   match &target {
     Ok(d) => {
       let config_lock = config.read().unwrap();
-      if config_lock.get(&format!("{d}_static")).unwrap() == "1" {
-        stream.write(build_packet(config_lock.get(&format!("{d}_res")).unwrap(), "OK", config_lock.get(&format!("{d}_body")).unwrap()).as_bytes()).expect("ahhhhhhhh!");
+      if get_config(&config_lock, d, "static").eq("1") {
+        stream.write(build_packet(&get_config(&config_lock, d, "res"), "OK", &get_config(&config_lock, d, "target")).as_bytes()).unwrap();
+      }else if get_config(&config_lock, d, "rproxy").eq("1") {
+        if content_length != 0 {
+          let mut buffer = vec![0u8; content_length];
+          reader.read_exact(&mut buffer).unwrap();
+          packet_buf.extend_from_slice(&buffer);
+        }
+
+        let mut tcp_client = TcpStream::connect(get_config(&config_lock, d, "target")).unwrap();
+        tcp_client.write(&packet_buf).unwrap();
+        tcp_client.flush().unwrap();
+
+        // res
+        let mut client_res = Vec::new();
+        let mut client_header = Vec::new();
+        let mut client_reader = BufReader::new(&mut tcp_client);
+        loop {
+          let mut buffer = Vec::new();
+          client_reader.read_until(b'\n', &mut buffer).unwrap();
+          if buffer.is_empty() { panic!("Error: Stream closed before headers complete"); }
+
+          client_res.extend_from_slice(&buffer);
+          client_header.extend_from_slice(&buffer);
+
+          if client_res.ends_with(b"\r\n\r\n") { break };
+        }
+
+        let mut header = match str::from_utf8(&client_header) {
+          Ok(v) => v.lines(),
+          Err(e) => panic!("Invalid UTF-8 sequence: {}", e),
+        };
+        let content_length = header.find(|&x| x.starts_with("Content-Length:")).unwrap_or(" 0").split(" ").nth(1).unwrap().parse::<usize>().unwrap_or(0);
+        if content_length != 0 {
+          let mut buffer = vec![0u8; content_length];
+          client_reader.read_exact(&mut buffer).unwrap();
+          client_res.extend_from_slice(&buffer);
+        }
+
+        stream.write(&client_res).unwrap();
+        stream.flush().unwrap();
       }
     },
-    Err(e) => {
-      stream.write(build_packet("404", "Not Found", "Not Found").as_bytes()).expect("ahhhhhhhh!");
+    Err(_) => {
+      stream.write(build_packet("404", "Not Found", "Not Found").as_bytes()).unwrap();
     }
   }
 
-  // stream.write(format!("{s}").as_bytes()).expect("ahhhhhhhh!");
+  // stream.write(format!("{s}").as_bytes()).unwrap();
   stream.flush().unwrap();
 }
 
@@ -271,7 +328,7 @@ fn listen(args: &Args, keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<Hash
 }
 
 fn demonize(args: &Args, keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<HashMap<String, String>>>) {
-  get_config(&keys, &config, &args.conf);
+  fetch_config(&keys, &config, &args.conf);
 
   // demonize
   let daemon = Daemonize::new()
@@ -303,7 +360,7 @@ fn demonize(args: &Args, keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<Ha
           }
           SIGHUP => {
             println!("reloading configuration…");
-            get_config(&keys, &config, &conf_file);
+            fetch_config(&keys, &config, &conf_file);
             println!("Successfully reloaded configuration.");
           }
           _ => (),
