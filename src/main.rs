@@ -234,7 +234,7 @@ fn handle_request(mut stream: TcpStream, keys: &Arc<RwLock<Vec<String>>>, config
   stream.flush().unwrap();
 }
 
-fn start(args: &Args, keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<HashMap<String, String>>>) {
+fn listen(args: &Args, keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<HashMap<String, String>>>) {
   let mut listeners = Vec::<TcpListener>::new();
   for host in args.addr.clone().unwrap() {
     listeners.push(TcpListener::bind(&host).unwrap());
@@ -312,7 +312,7 @@ fn demonize(args: &Args, keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<Ha
     });
   }
 
-  start(&args, &keys, &config);
+  listen(&args, &keys, &config);
 }
 
 fn main() {
