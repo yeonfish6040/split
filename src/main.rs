@@ -242,11 +242,9 @@ fn handle_request(mut stream: TcpStream, keys: &Arc<RwLock<Vec<String>>>, config
       if get_config(&config_lock, d, "static").eq("1") {
         stream.write(build_packet(&get_config(&config_lock, d, "res"), "OK", &get_config(&config_lock, d, "target")).as_bytes()).unwrap();
       }else if get_config(&config_lock, d, "rproxy").eq("1") {
-        if content_length != 0 {
-          let mut buffer = vec![0u8; content_length];
-          reader.read_exact(&mut buffer).unwrap();
-          packet_buf.extend_from_slice(&buffer);
-        }
+        let mut buffer = vec![0u8; content_length];
+        reader.read_exact(&mut buffer).unwrap();
+        packet_buf.extend_from_slice(&buffer);
 
         let mut tcp_client = TcpStream::connect(get_config(&config_lock, d, "target")).unwrap();
         tcp_client.write(&packet_buf).unwrap();
@@ -272,11 +270,9 @@ fn handle_request(mut stream: TcpStream, keys: &Arc<RwLock<Vec<String>>>, config
           Err(e) => panic!("Invalid UTF-8 sequence: {}", e),
         };
         let content_length = header.find(|&x| x.starts_with("Content-Length:")).unwrap_or(" 0").split(" ").nth(1).unwrap().parse::<usize>().unwrap_or(0);
-        if content_length != 0 {
-          let mut buffer = vec![0u8; content_length];
-          client_reader.read_exact(&mut buffer).unwrap();
-          client_res.extend_from_slice(&buffer);
-        }
+        let mut buffer = vec![0u8; content_length];
+        client_reader.read_exact(&mut buffer).unwrap();
+        client_res.extend_from_slice(&buffer);
 
         stream.write(&client_res).unwrap();
         stream.flush().unwrap();
