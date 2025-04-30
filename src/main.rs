@@ -178,20 +178,7 @@ fn get_matched_host_key<'a>(keys: &Arc<RwLock<Vec<String>>>, host: &str, path: &
   let key_lock =  keys.read().unwrap();
   let mut key_iter = key_lock.iter();
 
-  let search = key_iter.find(|&x| {
-    let host_tmp = x.split('/').next().unwrap_or(x);
-    if host_tmp.starts_with('*') {
-      // suffix
-      let suffix = &host_tmp[1..];
-      host.ends_with(suffix)
-    } else if host_tmp.ends_with('*') {
-      // prefix
-      let prefix = &host_tmp[..host_tmp.len()-1];
-      host.starts_with(prefix)
-    } else {
-      host == host_tmp
-    }
-  });
+  let search = key_iter.find(|&x| x == host);
 
   match search {
     Some(d) => {
