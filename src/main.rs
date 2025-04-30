@@ -1,16 +1,17 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+use httparse;
 use std::net::{TcpListener, TcpStream};
 use std::str;
 use std::sync::{Arc, RwLock, RwLockReadGuard};
 use std::thread;
 use std::thread::JoinHandle;
-use std::time::{Duration};
 use chrono::{Local, Utc};
 use clap::{Parser, Subcommand};
 use daemonize::Daemonize;
 use signal_hook::consts::{SIGHUP, SIGTERM};
 use signal_hook::iterator::Signals;
+use threadpool::ThreadPool;
 
 #[derive(Parser, Debug)]
 #[clap(disable_help_flag = true)]
@@ -23,7 +24,7 @@ struct Args {
   /// decide the action
   #[command(subcommand)]
   command: Commands,
-  
+
   /// configuration file location
   #[arg(short, long, default_value_t = String::from("/etc/split/split.conf"))]
   conf: String,
@@ -34,7 +35,7 @@ struct Args {
 
   /// max handler threads
   #[arg(short, long, default_value_t = 1024)]
-  max: u64,
+  max: usize,
 }
 
 #[derive(Subcommand, Debug)]
@@ -212,27 +213,53 @@ fn handle_request(mut stream: TcpStream, keys: &Arc<RwLock<Vec<String>>>, config
   let mut header_buf = Vec::new();
   let mut packet_buf = Vec::new();
 
-  let mut reader = BufReader::new(&mut stream);
-  loop {
-    let mut buffer = Vec::new();
-    reader.read_until(b'\n', &mut buffer).unwrap();
-    if buffer.is_empty() { panic!("Error: Stream closed before headers complete"); }
-
-    packet_buf.extend_from_slice(&buffer);
-    header_buf.extend_from_slice(&buffer);
-
-    if packet_buf.ends_with(b"\r\n\r\n") { break };
-  }
-
-  let s = match str::from_utf8(&header_buf) {
-    Ok(v) => v,
-    Err(e) => panic!("Invalid UTF-8 sequence: {}", e),
+  let success = {
+    let mut reader = BufReader::new(&mut stream);
+    loop {
+      let mut buffer = Vec::new();
+      match reader.read_until(b'\n', &mut buffer) {
+        Ok(0) => break false,
+        Ok(_) => (),
+        Err(_) => break false,
+      }
+      packet_buf.extend_from_slice(&buffer);
+      header_buf.extend_from_slice(&buffer);
+      if packet_buf.ends_with(b"\r\n\r\n") { break true; }
+    }
   };
 
-  let mut lines =  s.lines();
-  let path = lines.next().unwrap().split(" ").nth(1).unwrap();
-  let host = lines.find(|&x| x.starts_with("Host:")).unwrap().split(" ").nth(1).unwrap();
-  let content_length = lines.find(|&x| x.starts_with("Content-Length:")).unwrap_or(" 0").split(" ").nth(1).unwrap().parse::<usize>().unwrap_or(0);
+  if !success {
+    stream.write(build_packet("502", "Bad Gateway", "Upstream closed connection unexpectedly").as_bytes()).unwrap();
+    stream.flush().unwrap();
+    return;
+  }
+
+  let mut headers = [httparse::EMPTY_HEADER; 32];
+  let mut req = httparse::Request::new(&mut headers);
+
+  match req.parse(&header_buf) {
+      Ok(httparse::Status::Complete(_)) => {}
+      _ => {
+          stream.write(build_packet("400", "Bad Request", "Malformed Request").as_bytes()).unwrap();
+          stream.flush().unwrap();
+          return;
+      }
+  }
+
+  let path = req.path.unwrap_or("");
+
+  let host = req.headers.iter()
+      .find(|h| h.name.eq_ignore_ascii_case("Host"))
+      .map(|h| str::from_utf8(h.value).unwrap_or(""))
+      .unwrap_or("");
+
+  let content_length = req.headers.iter()
+      .find(|h| h.name.eq_ignore_ascii_case("Content-Length"))
+      .map(|h| str::from_utf8(h.value).unwrap_or("0"))
+      .unwrap_or("0")
+      .parse::<usize>()
+      .unwrap_or(0);
+
   print!("[LOG] {}{}   {} {}{}\n", Local::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(), Local::now().offset().to_string(), peer_addr, host, path);
 
   let target = get_matched_host_key(&keys, &host, &path);
@@ -243,6 +270,7 @@ fn handle_request(mut stream: TcpStream, keys: &Arc<RwLock<Vec<String>>>, config
         stream.write(build_packet(&get_config(&config_lock, d, "res"), "OK", &get_config(&config_lock, d, "target")).as_bytes()).unwrap();
       }else if get_config(&config_lock, d, "rproxy").eq("1") {
         if content_length != 0 {
+          let mut reader = BufReader::new(&mut stream);
           let mut buffer = vec![0u8; content_length];
           reader.read_exact(&mut buffer).unwrap();
           packet_buf.extend_from_slice(&buffer);
@@ -287,7 +315,6 @@ fn handle_request(mut stream: TcpStream, keys: &Arc<RwLock<Vec<String>>>, config
     }
   }
 
-  // stream.write(format!("{s}").as_bytes()).unwrap();
   stream.flush().unwrap();
 }
 
@@ -298,25 +325,20 @@ fn listen(args: &Args, keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<Hash
     println!("{}", format!("Currently listening on {host}"));
   }
 
+  let pool = ThreadPool::new(args.max);
   let mut threads = Vec::<JoinHandle<()>>::new();
   for listener in listeners {
     let keys = Arc::clone(&keys);
     let config = Arc::clone(&config);
-    let thread_count = Arc::new(RwLock::new(0u64));
-    let max_threads = args.max;
+    let pool = ThreadPool::clone(&pool);
     let thread = thread::spawn(move || {
       for stream in listener.incoming() {
         let stream = stream.unwrap();
         let keys = Arc::clone(&keys);
         let config = Arc::clone(&config);
-        let thread_count = Arc::clone(&thread_count);
 
-        while thread_count.read().unwrap().ge(&max_threads) { thread::sleep(Duration::from_millis(10)); }
-        thread::spawn(move || {
-          let thread_count_clone = Arc::clone(&thread_count);
-          { let mut cnt = thread_count_clone.write().unwrap(); *cnt += 1; }
+        pool.execute(move || {
           handle_request(stream, &keys, &config);
-          { let mut cnt = thread_count_clone.write().unwrap(); *cnt -= 1; }
         });
       }
     });
