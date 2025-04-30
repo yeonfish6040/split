@@ -1,0 +1,70 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - x86_64-unknown-linux-musl
+          - x86_64-pc-windows-gnu
+          - x86_64-apple-darwin
+          - aarch64-unknown-linux-gnu
+          - aarch64-unknown-linux-musl
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          target: ${{ matrix.target }}
+          override: true
+
+      - name: Install cross
+        run: cargo install cross
+
+      - name: Build binary
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Rename and Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: split-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/split${{ matrix.target == 'x86_64-pc-windows-gnu' && '.exe' || '' }}
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Archive binaries
+        run: |
+          mkdir dist
+          for dir in artifacts/*; do
+            name=$(basename "$dir")
+            # 확장자 추가 (Windows는 .exe)
+            bin_name="myapp"
+            [[ "$name" == *windows* ]] && bin_name="myapp.exe"
+
+            cp "$dir/$bin_name" "dist/$name"
+            cd dist
+            zip -r "$name.zip" "$name"
+            rm "$name"
+            cd ..
+          done
+
+      - name: Upload release to GitHub
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip
