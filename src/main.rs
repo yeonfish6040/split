@@ -1,17 +1,22 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use httparse;
 use std::net::{TcpListener, TcpStream};
 use std::{str, time};
 use std::sync::{Arc, RwLock, RwLockReadGuard};
 use std::thread;
-use std::thread::JoinHandle;
 use chrono::{Local, Utc};
 use clap::{Parser, Subcommand};
 use daemonize::Daemonize;
+use futures::executor::block_on;
+use rustls_acme::AcmeConfig;
+use rustls_acme::caches::DirCache;
 use signal_hook::consts::{SIGHUP, SIGTERM};
 use signal_hook::iterator::Signals;
 use threadpool::ThreadPool;
+use futures::prelude::*;
+use rustls_acme::futures_rustls::server::TlsStream;
+use tracing_subscriber::FmtSubscriber;
 
 #[derive(Parser, Debug)]
 #[clap(disable_help_flag = true)]
@@ -29,9 +34,13 @@ struct Args {
   #[arg(short, long, default_value_t = String::from("/etc/split/split.conf"))]
   conf: String,
 
-  /// addr to listen
-  #[arg(short, long, value_delimiter = ' ', default_values = ["0.0.0.0:80", "0.0.0.0:443"])]
-  addr: Option<Vec<String>>,
+  /// addr to listen http requests
+  #[arg(long, value_delimiter = ' ', default_value = "0.0.0.0:80")]
+  http_host: String,
+
+  /// addr to listen https requests
+  #[arg(long, value_delimiter = ' ', default_value = "0.0.0.0:443")]
+  https_host: String,
 
   /// max handler threads
   #[arg(short, long, default_value_t = 1024)]
@@ -48,6 +57,26 @@ enum Commands {
   Restart,
   /// reload daemon
   Reload,
+}
+
+struct BlockingTlsStream {
+  inner: TlsStream<smol::net::TcpStream>,
+}
+
+impl Read for BlockingTlsStream {
+  fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+    block_on(self.inner.read(buf))
+  }
+}
+
+impl Write for BlockingTlsStream {
+  fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+    block_on(self.inner.write(buf))
+  }
+
+  fn flush(&mut self) -> std::io::Result<()> {
+    block_on(self.inner.flush())
+  }
 }
 
 // utils
@@ -194,8 +223,7 @@ fn get_config(config_lock: &RwLockReadGuard<HashMap<String, String>>, target: &s
 }
 
 // functionality
-fn handle_request(mut stream: TcpStream, keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<HashMap<String, String>>>) {
-  let peer_addr = stream.peer_addr().unwrap();
+fn handle_request<S: Read + Write>(mut stream: S, keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<HashMap<String, String>>>, peer_addr: &str) {
 
   let mut header_buf = Vec::new();
   let mut packet_buf = Vec::new();
@@ -317,37 +345,89 @@ fn handle_request(mut stream: TcpStream, keys: &Arc<RwLock<Vec<String>>>, config
 }
 
 fn listen(args: &Args, keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<HashMap<String, String>>>) {
-  let mut listeners = Vec::<TcpListener>::new();
-  for host in args.addr.clone().unwrap() {
-    listeners.push(TcpListener::bind(&host).unwrap());
-    println!("{}", format!("Currently listening on {host}"));
-  }
+  let hosts: Vec<String> = {
+    let tmp_lock = keys.read().unwrap();
+    tmp_lock
+        .iter()
+        .filter_map(|x| x.split('/').next().map(|s| s.to_string()))
+        .filter(|x| !x.is_empty())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect()
+  };
+
 
   let pool = ThreadPool::new(args.max);
-  let mut threads = Vec::<JoinHandle<()>>::new();
-  for listener in listeners {
-    let keys = Arc::clone(&keys);
-    let config = Arc::clone(&config);
-    let pool = ThreadPool::clone(&pool);
-    let thread = thread::spawn(move || {
-      for stream in listener.incoming() {
-        let stream = stream.unwrap();
-        let keys = Arc::clone(&keys);
-        let config = Arc::clone(&config);
+  {
+    let keys1 = Arc::clone(&keys);
+    let keys2 = Arc::clone(&keys);
+    let config1 = Arc::clone(&config);
+    let config2 = Arc::clone(&config);
+    let pool1 = ThreadPool::clone(&pool);
+    let pool2 = ThreadPool::clone(&pool);
 
-        pool.execute(move || {
-          handle_request(stream, &keys, &config);
+    let host = String::clone(&args.http_host);
+    let http_thread = thread::spawn(move || {
+      let http_listener = TcpListener::bind(&host).unwrap();
+
+      for stream in http_listener.incoming() {
+        let stream = stream.unwrap();
+        let keys = Arc::clone(&keys1);
+        let config = Arc::clone(&config1);
+
+        pool1.execute(move || {
+          let addr = stream.peer_addr().unwrap();
+          handle_request(stream, &keys, &config, &addr.to_string());
         });
       }
     });
-    threads.push(thread);
-  }
-  for thread in threads {
-    thread.join().expect("Cannot join thread.");
+
+    let host = String::clone(&args.https_host);
+    let https_thread = thread::spawn(move || {
+      tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+          let https_listener = smol::net::TcpListener::bind(&host).await.unwrap();
+
+          println!("{:?}", hosts);
+          let mut tls_incoming = AcmeConfig::new(hosts)
+              .cache(DirCache::new("/etc/split/cache"))
+              .directory_lets_encrypt(true)
+              .incoming(https_listener.incoming(), Vec::new());
+
+          while let Some(tls) = tls_incoming.next().await {
+            let tls_stream = tls.unwrap();
+
+            let keys = Arc::clone(&keys2);
+            let config = Arc::clone(&config2);
+
+            pool2.execute(move || {
+              let addr = tls_stream.get_ref().0.peer_addr().unwrap();
+              let blocking_stream = BlockingTlsStream { inner: tls_stream };
+              handle_request(blocking_stream, &keys, &config, &addr.to_string());
+            });
+          }
+        });
+    });
+
+    println!("Listening on {} for http traffic", &args.http_host);
+    println!("Listening on {} for https traffic", &args.https_host);
+
+    http_thread.join().unwrap();
+    https_thread.join().unwrap();
   }
 }
 
 fn demonize(args: &Args, keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<HashMap<String, String>>>) {
+  let subscriber = FmtSubscriber::builder()
+      .with_max_level(tracing::Level::INFO)
+      .finish();
+
+  tracing::subscriber::set_global_default(subscriber)
+      .expect("setting default subscriber failed");
+
   fetch_config(&keys, &config, &args.conf);
 
   // demonize
