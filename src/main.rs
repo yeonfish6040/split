@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use httparse;
 use std::net::{TcpListener, TcpStream};
-use std::str;
+use std::{str, time};
 use std::sync::{Arc, RwLock, RwLockReadGuard};
 use std::thread;
 use std::thread::JoinHandle;
@@ -295,11 +295,22 @@ fn handle_request(mut stream: TcpStream, keys: &Arc<RwLock<Vec<String>>>, config
           if client_res.ends_with(b"\r\n\r\n") { break };
         }
 
-        let mut header = match str::from_utf8(&client_header) {
-          Ok(v) => v.lines(),
-          Err(e) => panic!("Invalid UTF-8 sequence: {}", e),
-        };
-        let content_length = header.find(|&x| x.starts_with("Content-Length:")).unwrap_or(" 0").split(" ").nth(1).unwrap().parse::<usize>().unwrap_or(0);
+        let mut client_headers = [httparse::EMPTY_HEADER; 32];
+        let mut client_req = httparse::Response::new(&mut client_headers);
+        match client_req.parse(&client_header) {
+          Ok(httparse::Status::Complete(_)) => {}
+          _ => {
+            stream.write(build_packet("400", "Bad Request", "Malformed Request").as_bytes()).unwrap();
+            stream.flush().unwrap();
+            return;
+          },
+        }
+        let content_length = client_req.headers.iter()
+            .find(|h| h.name.eq_ignore_ascii_case("Content-Length"))
+            .map(|h| str::from_utf8(h.value).unwrap_or("0"))
+            .unwrap_or("0")
+            .parse::<usize>()
+            .unwrap_or(0);
         if content_length != 0 {
           let mut buffer = vec![0u8; content_length];
           client_reader.read_exact(&mut buffer).unwrap();
@@ -423,6 +434,7 @@ fn main() {
       let pid = get_pid();
       nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), nix::sys::signal::SIGTERM)
           .unwrap();
+      thread::sleep(time::Duration::from_millis(10));
       println!("restarted daemon");
       demonize(&args, &keys, &config);
     }
