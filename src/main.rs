@@ -81,12 +81,6 @@ impl Write for BlockingTlsStream {
   }
 }
 
-impl Drop for BlockingTlsStream {
-  fn drop(&mut self) {
-    block_on(self.inner.close()).unwrap()
-  }
-}
-
 trait HasHeaders<'a> {
   fn headers(&self) -> &[httparse::Header<'a>];
 }
@@ -321,11 +315,12 @@ fn handle_request<S: Read + Write + Send + 'static>(mut client_stream: S, keys: 
   let mut client_req_header = [httparse::EMPTY_HEADER; 32];
   let mut client_req = Request::new(&mut client_req_header);
 
-  match client_req.parse(&client_req_header_buf) {
+  let client_header_buf_clone = client_req_header_buf.clone();
+  match client_req.parse(&client_header_buf_clone) {
     Ok(httparse::Status::Complete(_)) => {}
     _ => {
-      client_stream.write(build_packet("400", "Bad Request", "Malformed Request").as_bytes()).unwrap();
-      client_stream.flush().unwrap();
+      client_stream.write_all(build_packet("400", "Bad Request", "Malformed Request").as_bytes()).ok();
+      client_stream.flush().ok();
       return;
     }
   }
@@ -341,9 +336,9 @@ fn handle_request<S: Read + Write + Send + 'static>(mut client_stream: S, keys: 
     if let Some(key_auth) = resolver.get_http_01_key_auth(token) {
       let body = key_auth;
       let resp = build_packet("200", "OK", &body);
-      client_stream.write_all(resp.as_bytes()).unwrap();
+      client_stream.write_all(resp.as_bytes()).ok();
     } else {
-      client_stream.write_all(build_packet("404", "Not Found", "Not Found").as_bytes()).unwrap();
+      client_stream.write_all(build_packet("404", "Not Found", "Not Found").as_bytes()).ok();
     }
     return;
   }
@@ -360,12 +355,12 @@ fn handle_request<S: Read + Write + Send + 'static>(mut client_stream: S, keys: 
     Ok(host_key) => {
       let config_lock = config.read().unwrap();
       if get_config(&config_lock, host_key, "static").eq("1") {
-        client_stream.write(build_packet(&get_config(&config_lock, host_key, "res"), "OK", &get_config(&config_lock, host_key, "target")).as_bytes()).unwrap();
+        client_stream.write_all(build_packet(&get_config(&config_lock, host_key, "res"), "OK", &get_config(&config_lock, host_key, "target")).as_bytes()).ok();
       } else if get_config(&config_lock, host_key, "rproxy").eq("1") {
 
         let mut target_stream = TcpStream::connect(get_config(&config_lock, host_key, "target")).unwrap();
-        target_stream.write_all(&client_req_header_buf).unwrap();
-        target_stream.flush().unwrap();
+        target_stream.write_all(&client_req_header_buf).ok();
+        target_stream.flush().ok();
 
         if is_websocket {
           let mut target_res_header_buf = Vec::new();
@@ -445,7 +440,7 @@ fn handle_request<S: Read + Write + Send + 'static>(mut client_stream: S, keys: 
     }
     Err(_) => {
       client_stream.write_all(build_packet("404", "Not Found", "Not Found").as_bytes()).unwrap();
-    } 
+    }
   }
 }
 
