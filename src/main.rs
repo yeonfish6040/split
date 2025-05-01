@@ -251,9 +251,7 @@ fn get_config(config_lock: &RwLockReadGuard<HashMap<String, String>>, target: &s
 fn transfer_data<'a, Src, Dest, H>(
   mut client_reader: BufReader<&mut Src>,
   mut target_stream: Dest,
-  client_header: &Vec<u8>,
   client_req: &H,
-  target_addr: &str,
 ) -> Result<Dest, ()>
 where
     Src: Read + Write + Send + 'static,
@@ -263,9 +261,6 @@ where
   let mut req_type = "";
   if client_req.headers().iter().any(|h| h.name.eq_ignore_ascii_case("Transfer-Encoding") && str::from_utf8(h.value).unwrap_or("").contains("chunked")) {
     req_type = "chunked";
-  }
-  if client_req.headers().iter().any(|h| { h.name.eq_ignore_ascii_case("Upgrade") && str::from_utf8(h.value).unwrap_or("").eq_ignore_ascii_case("websocket") }) {
-    req_type = "websocket";
   }
 
   match req_type {
@@ -290,35 +285,6 @@ where
         target_stream.write_all(&chunk).unwrap();
         target_stream.flush().unwrap();
       }
-    }
-    "websocket" => {
-      let mut backend = TcpStream::connect(target_addr).unwrap();
-
-      backend.write_all(&client_header).unwrap();
-      backend.flush().unwrap();
-
-      use std::sync::{Arc, Mutex};
-
-      let client = Arc::new(Mutex::new(target_stream));      // 프론트
-      let server = Arc::new(Mutex::new(backend));     // 백엔드
-
-      {
-        let client = Arc::clone(&client);
-        let server = Arc::clone(&server);
-        thread::spawn(move || {
-          std::io::copy(&mut *client.lock().unwrap(), &mut *server.lock().unwrap()).ok();
-        })
-      };
-
-      {
-        let client = Arc::clone(&client);
-        let server = Arc::clone(&server);
-        thread::spawn(move || {
-          std::io::copy(&mut *server.lock().unwrap(), &mut *client.lock().unwrap()).ok();
-        })
-      };
-
-      return Err(());
     }
     _ => {
       let content_length = client_req.headers().iter()
@@ -364,6 +330,11 @@ fn handle_request<S: Read + Write + Send + 'static>(mut client_stream: S, keys: 
     }
   }
 
+  let is_websocket = client_req.headers.iter()
+      .any(|h| h.name.eq_ignore_ascii_case("Upgrade")
+           && str::from_utf8(h.value).unwrap_or("")
+                  .eq_ignore_ascii_case("websocket"));
+
   let path = client_req.path.unwrap_or("");
   if path.starts_with("/.well-known/acme-challenge/") {
     let token = path.rsplit('/').next().unwrap_or_default();
@@ -390,15 +361,57 @@ fn handle_request<S: Read + Write + Send + 'static>(mut client_stream: S, keys: 
       let config_lock = config.read().unwrap();
       if get_config(&config_lock, host_key, "static").eq("1") {
         client_stream.write(build_packet(&get_config(&config_lock, host_key, "res"), "OK", &get_config(&config_lock, host_key, "target")).as_bytes()).unwrap();
-      }else if get_config(&config_lock, host_key, "rproxy").eq("1") {
+      } else if get_config(&config_lock, host_key, "rproxy").eq("1") {
 
         let mut target_stream = TcpStream::connect(get_config(&config_lock, host_key, "target")).unwrap();
-        target_stream.write(&client_req_header_buf).unwrap();
+        target_stream.write_all(&client_req_header_buf).unwrap();
         target_stream.flush().unwrap();
 
-        target_stream = transfer_data::<S, TcpStream, Request>(client_req_reader, target_stream, &client_req_header_buf, &client_req, host).unwrap();
+        if is_websocket {
+          let mut target_res_header_buf = Vec::new();
+          let mut target_res_reader = BufReader::new(target_stream);
+          loop {
+            let mut buffer = Vec::new();
+            target_res_reader.read_until(b'\n', &mut buffer).unwrap();
+            if buffer.is_empty() { break; }
+            target_res_header_buf.extend_from_slice(&buffer);
+            if target_res_header_buf.ends_with(b"\r\n\r\n") { break }
+          }
 
-        // res
+          drop(client_req_reader);
+
+          client_stream.write_all(&target_res_header_buf).unwrap();
+          client_stream.flush().unwrap();
+
+          use std::sync::{Arc, Mutex};
+          let client_arc = Arc::new(Mutex::new(client_stream));
+          let server_arc = Arc::new(Mutex::new(target_res_reader.into_inner()));
+
+          {
+            let c = Arc::clone(&client_arc);
+            let s = Arc::clone(&server_arc);
+            thread::spawn(move || {
+              std::io::copy(&mut *c.lock().unwrap(), &mut *s.lock().unwrap()).ok();
+            });
+          }
+          {
+            let c = Arc::clone(&client_arc);
+            let s = Arc::clone(&server_arc);
+            thread::spawn(move || {
+              std::io::copy(&mut *s.lock().unwrap(), &mut *c.lock().unwrap()).ok();
+            });
+          }
+
+          return;
+        }
+
+        target_stream = transfer_data::<S, TcpStream, Request>(
+          client_req_reader,
+          target_stream,
+          &client_req,
+        ).unwrap();
+
+        // 백엔드 응답 헤더 수신
         let mut target_res_header_buf = Vec::new();
         let mut target_res_reader = BufReader::new(&mut target_stream);
         loop {
@@ -416,19 +429,23 @@ fn handle_request<S: Read + Write + Send + 'static>(mut client_stream: S, keys: 
         match target_res.parse(&target_res_header_buf) {
           Ok(httparse::Status::Complete(_)) => {}
           _ => {
-            client_stream.write(build_packet("400", "Bad Request", "Malformed Request").as_bytes()).unwrap();
+            client_stream.write_all(build_packet("400", "Bad Request", "Malformed Request").as_bytes()).unwrap();
             client_stream.flush().unwrap();
             return;
           },
         }
 
         client_stream.write_all(&target_res_header_buf).unwrap();
-        transfer_data::<TcpStream, S, Response>(target_res_reader, client_stream, &target_res_header_buf, &target_res, &get_config(&config_lock, host_key, "target")).unwrap();
+        transfer_data::<TcpStream, S, Response>(
+          target_res_reader,
+          client_stream,
+          &target_res,
+        ).unwrap();
       }
     }
     Err(_) => {
-      client_stream.write(build_packet("404", "Not Found", "Not Found").as_bytes()).unwrap();
-    }
+      client_stream.write_all(build_packet("404", "Not Found", "Not Found").as_bytes()).unwrap();
+    } 
   }
 }
 
