@@ -303,7 +303,6 @@ fn handle_request<S: Read + Write>(mut stream: S, keys: &Arc<RwLock<Vec<String>>
         tcp_client.flush().unwrap();
 
         // res
-        let mut client_res = Vec::new();
         let mut client_header = Vec::new();
         let mut client_reader = BufReader::new(&mut tcp_client);
         loop {
@@ -311,10 +310,9 @@ fn handle_request<S: Read + Write>(mut stream: S, keys: &Arc<RwLock<Vec<String>>
           client_reader.read_until(b'\n', &mut buffer).unwrap();
           if buffer.is_empty() { panic!("Error: Stream closed before headers complete"); }
 
-          client_res.extend_from_slice(&buffer);
           client_header.extend_from_slice(&buffer);
 
-          if client_res.ends_with(b"\r\n\r\n") { break };
+          if client_header.ends_with(b"\r\n\r\n") { break };
         }
 
         let mut client_headers = [httparse::EMPTY_HEADER; 32];
@@ -334,8 +332,12 @@ fn handle_request<S: Read + Write>(mut stream: S, keys: &Arc<RwLock<Vec<String>>
             .parse::<usize>()
             .unwrap_or(0);
 
+        let mut body_buf = vec![0u8; content_length];
+        client_reader.read_exact(&mut body_buf).unwrap();
+
         stream.write_all(&client_header).unwrap();
-        copy(&mut client_reader, &mut stream).unwrap();
+        stream.write_all(&body_buf).unwrap();
+
         stream.flush().unwrap();
       }
     },
