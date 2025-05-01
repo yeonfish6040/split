@@ -513,7 +513,6 @@ fn listen(args: &Args, keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<Hash
             smol::block_on(async move {
               let start_handshake = LazyConfigAcceptor::new(Default::default(), stream).await.unwrap();
 
-              println!("{:?}", &start_handshake.client_hello());
               if is_tls_alpn_challenge(&start_handshake.client_hello()) {
                 println!("received TLS-ALPN-01 validation request");
                 let mut tls = start_handshake.into_stream(challenge_rustls_config).await.unwrap();
