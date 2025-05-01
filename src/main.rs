@@ -17,6 +17,7 @@ use futures::prelude::*;
 use httparse::{Request, Response};
 use rustls_acme::caches::DirCache;
 use rustls_acme::futures_rustls::LazyConfigAcceptor;
+use rustls_acme::futures_rustls::rustls::ServerConfig;
 use rustls_acme::futures_rustls::server::TlsStream;
 use tracing_subscriber::FmtSubscriber;
 
@@ -338,35 +339,35 @@ where
   Ok(target_stream)
 }
 
-fn handle_request<S: Read + Write + Send + 'static>(mut stream: S, keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<HashMap<String, String>>>, peer_addr: &str) {
-  let mut header_buf = Vec::new();
-  let mut reader = BufReader::new(&mut stream);
+fn handle_request<S: Read + Write + Send + 'static>(mut client_stream: S, keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<HashMap<String, String>>>, peer_addr: &str) {
+  let mut client_req_header_buf = Vec::new();
+  let mut client_req_reader = BufReader::new(&mut client_stream);
 
   loop {
     let mut buffer = Vec::new();
-    reader.read_until(b'\n', &mut buffer).unwrap();
+    client_req_reader.read_until(b'\n', &mut buffer).unwrap();
     if buffer.is_empty() { panic!("Error: Stream closed before headers complete"); }
 
-    header_buf.extend_from_slice(&buffer);
+    client_req_header_buf.extend_from_slice(&buffer);
 
-    if header_buf.ends_with(b"\r\n\r\n") { break };
+    if client_req_header_buf.ends_with(b"\r\n\r\n") { break };
   }
 
-  let mut headers = [httparse::EMPTY_HEADER; 32];
-  let mut req = Request::new(&mut headers);
+  let mut client_req_header = [httparse::EMPTY_HEADER; 32];
+  let mut client_req = Request::new(&mut client_req_header);
 
-  match req.parse(&header_buf) {
+  match client_req.parse(&client_req_header_buf) {
       Ok(httparse::Status::Complete(_)) => {}
       _ => {
-          stream.write(build_packet("400", "Bad Request", "Malformed Request").as_bytes()).unwrap();
-          stream.flush().unwrap();
+          client_stream.write(build_packet("400", "Bad Request", "Malformed Request").as_bytes()).unwrap();
+          client_stream.flush().unwrap();
           return;
       }
   }
 
-  let path = req.path.unwrap_or("");
+  let path = client_req.path.unwrap_or("");
 
-  let host = req.headers.iter()
+  let host = client_req.headers.iter()
       .find(|h| h.name.eq_ignore_ascii_case("Host"))
       .map(|h| str::from_utf8(h.value).unwrap_or(""))
       .unwrap_or("");
@@ -378,45 +379,45 @@ fn handle_request<S: Read + Write + Send + 'static>(mut stream: S, keys: &Arc<Rw
     Ok(host_key) => {
       let config_lock = config.read().unwrap();
       if get_config(&config_lock, host_key, "static").eq("1") {
-        stream.write(build_packet(&get_config(&config_lock, host_key, "res"), "OK", &get_config(&config_lock, host_key, "target")).as_bytes()).unwrap();
+        client_stream.write(build_packet(&get_config(&config_lock, host_key, "res"), "OK", &get_config(&config_lock, host_key, "target")).as_bytes()).unwrap();
       }else if get_config(&config_lock, host_key, "rproxy").eq("1") {
 
-        let mut tcp_client = TcpStream::connect(get_config(&config_lock, host_key, "target")).unwrap();
-        tcp_client.write(&header_buf).unwrap();
-        tcp_client.flush().unwrap();
+        let mut target_stream = TcpStream::connect(get_config(&config_lock, host_key, "target")).unwrap();
+        target_stream.write(&client_req_header_buf).unwrap();
+        target_stream.flush().unwrap();
 
-        tcp_client = transfer_data::<S, TcpStream, Request>(reader, tcp_client, &header_buf, &req, host).unwrap();
+        target_stream = transfer_data::<S, TcpStream, Request>(client_req_reader, target_stream, &client_req_header_buf, &client_req, host).unwrap();
 
         // res
-        let mut client_header = Vec::new();
-        let mut client_reader = BufReader::new(&mut tcp_client);
+        let mut target_res_header_buf = Vec::new();
+        let mut target_res_reader = BufReader::new(&mut target_stream);
         loop {
           let mut buffer = Vec::new();
-          client_reader.read_until(b'\n', &mut buffer).unwrap();
+          target_res_reader.read_until(b'\n', &mut buffer).unwrap();
           if buffer.is_empty() { panic!("Error: Stream closed before headers complete"); }
 
-          client_header.extend_from_slice(&buffer);
+          target_res_header_buf.extend_from_slice(&buffer);
 
-          if client_header.ends_with(b"\r\n\r\n") { break };
+          if target_res_header_buf.ends_with(b"\r\n\r\n") { break };
         }
 
-        let mut client_headers = [httparse::EMPTY_HEADER; 32];
-        let mut client_req = Response::new(&mut client_headers);
-        match client_req.parse(&client_header) {
+        let mut target_res_header = [httparse::EMPTY_HEADER; 32];
+        let mut target_res = Response::new(&mut target_res_header);
+        match target_res.parse(&target_res_header_buf) {
           Ok(httparse::Status::Complete(_)) => {}
           _ => {
-            stream.write(build_packet("400", "Bad Request", "Malformed Request").as_bytes()).unwrap();
-            stream.flush().unwrap();
+            client_stream.write(build_packet("400", "Bad Request", "Malformed Request").as_bytes()).unwrap();
+            client_stream.flush().unwrap();
             return;
           },
         }
 
-        stream.write_all(&client_header).unwrap();
-        transfer_data::<TcpStream, S, Response>(client_reader, stream, &client_header, &client_req, &get_config(&config_lock, host_key, "target")).unwrap();
+        client_stream.write_all(&target_res_header_buf).unwrap();
+        transfer_data::<TcpStream, S, Response>(target_res_reader, client_stream, &target_res_header_buf, &target_res, &get_config(&config_lock, host_key, "target")).unwrap();
       }
     }
     Err(_) => {
-      stream.write(build_packet("404", "Not Found", "Not Found").as_bytes()).unwrap();
+      client_stream.write(build_packet("404", "Not Found", "Not Found").as_bytes()).unwrap();
     }
   }
 }
@@ -462,7 +463,7 @@ fn listen(args: &Args, keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<Hash
     let host = String::clone(&args.https_host);
     let https_thread = thread::spawn(move || {
       smol::block_on(async {
-          let https_listener = smol::net::TcpListener::bind(&host).await.unwrap();
+        let https_listener = smol::net::TcpListener::bind(&host).await.unwrap();
 
         let mut state = AcmeConfig::new(hosts.clone())
             .directory_lets_encrypt(true)
