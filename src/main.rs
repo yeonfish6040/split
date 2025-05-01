@@ -394,7 +394,7 @@ fn listen(args: &Args, keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<Hash
           let https_listener = smol::net::TcpListener::bind(&host).await.unwrap();
 
           let mut state = AcmeConfig::new(hosts)
-              .directory_lets_encrypt(false)
+              .directory_lets_encrypt(true)
               .state();
           let challenge_rustls_config = state.challenge_rustls_config();
           let default_rustls_config = state.default_rustls_config();
