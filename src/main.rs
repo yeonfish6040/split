@@ -393,7 +393,7 @@ fn listen(args: &Args, keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<Hash
           let https_listener = smol::net::TcpListener::bind(&host).await.unwrap();
 
         let mut state = AcmeConfig::new(hosts.clone())
-            .directory_lets_encrypt(true)
+            .directory_lets_encrypt(false)
             .challenge_type(UseChallenge::Http01)
             .cache(DirCache::new("/etc/split/certs"))
             .state();
