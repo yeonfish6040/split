@@ -370,7 +370,7 @@ fn handle_request<S: Read + Write + Send + 'static>(mut stream: S, keys: &Arc<Rw
             let client = Arc::new(Mutex::new(stream));      // 프론트
             let server = Arc::new(Mutex::new(backend));     // 백엔드
 
-            let c2s = {
+            {
               let client = Arc::clone(&client);
               let server = Arc::clone(&server);
               thread::spawn(move || {
@@ -378,16 +378,13 @@ fn handle_request<S: Read + Write + Send + 'static>(mut stream: S, keys: &Arc<Rw
               })
             };
 
-            let s2c = {
+            {
               let client = Arc::clone(&client);
               let server = Arc::clone(&server);
               thread::spawn(move || {
                 std::io::copy(&mut *server.lock().unwrap(), &mut *client.lock().unwrap()).ok();
               })
             };
-
-            c2s.join().ok();
-            s2c.join().ok();
           }
           _ => {
             let content_length = client_req.headers.iter()
