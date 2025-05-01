@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::io::{copy, BufRead, BufReader, ErrorKind, Read, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use httparse;
 use std::net::{TcpListener, TcpStream};
 use std::{str, time};
