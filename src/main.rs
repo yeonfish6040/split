@@ -230,7 +230,7 @@ fn get_config(config_lock: &RwLockReadGuard<HashMap<String, String>>, target: &s
 }
 
 // functionality
-fn handle_request<S: Read + Write>(mut stream: S, keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<HashMap<String, String>>>, peer_addr: &str) {
+fn handle_request<S: Read + Write + Send + 'static>(mut stream: S, keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<HashMap<String, String>>>, peer_addr: &str) {
 
   let mut header_buf = Vec::new();
   let mut packet_buf = Vec::new();
@@ -325,25 +325,89 @@ fn handle_request<S: Read + Write>(mut stream: S, keys: &Arc<RwLock<Vec<String>>
             return;
           },
         }
-        let content_length = client_req.headers.iter()
-            .find(|h| h.name.eq_ignore_ascii_case("Content-Length"))
-            .map(|h| str::from_utf8(h.value).unwrap_or("0"))
-            .unwrap_or("0")
-            .parse::<usize>()
-            .unwrap_or(0);
+
+        let mut req_type = "";
+        if client_req.headers.iter().any(|h| h.name.eq_ignore_ascii_case("Transfer-Encoding") && str::from_utf8(h.value).unwrap_or("").contains("chunked")) {
+          req_type = "chunked";
+        }
+        if req.headers.iter().any(|h| { h.name.eq_ignore_ascii_case("Upgrade") && str::from_utf8(h.value).unwrap_or("").eq_ignore_ascii_case("websocket") }) {
+          req_type = "websocket";
+        }
 
         stream.write_all(&client_header).unwrap();
-        std::io::copy(&mut client_reader, &mut stream).unwrap();
 
-        stream.flush().unwrap();
+        match req_type {
+          "chunked" => {
+            loop {
+              let mut line = Vec::new();
+              client_reader.read_until(b'\n', &mut line).unwrap();
+              if line.is_empty() { break; }
+              stream.write_all(&line).unwrap();
+
+              let chunk_size_line = String::from_utf8_lossy(&line);
+              if chunk_size_line.trim() == "0" {
+                let mut trailer = Vec::new();
+                client_reader.read_until(b'\n', &mut trailer).unwrap();
+                stream.write_all(&trailer).unwrap();
+                break;
+              }
+
+              let chunk_size = usize::from_str_radix(chunk_size_line.trim(), 16).unwrap();
+              let mut chunk = vec![0u8; chunk_size + 2];
+              client_reader.read_exact(&mut chunk).unwrap();
+              stream.write_all(&chunk).unwrap();
+            }
+          }
+          "websocket" => {
+            let target_addr = get_config(&config_lock, d, "target");
+            let mut backend = TcpStream::connect(target_addr).unwrap();
+
+            backend.write_all(&packet_buf).unwrap();
+            backend.flush().unwrap();
+
+            use std::sync::{Arc, Mutex};
+
+            let client = Arc::new(Mutex::new(stream));      // 프론트
+            let server = Arc::new(Mutex::new(backend));     // 백엔드
+
+            let c2s = {
+              let client = Arc::clone(&client);
+              let server = Arc::clone(&server);
+              thread::spawn(move || {
+                std::io::copy(&mut *client.lock().unwrap(), &mut *server.lock().unwrap()).ok();
+              })
+            };
+
+            let s2c = {
+              let client = Arc::clone(&client);
+              let server = Arc::clone(&server);
+              thread::spawn(move || {
+                std::io::copy(&mut *server.lock().unwrap(), &mut *client.lock().unwrap()).ok();
+              })
+            };
+
+            c2s.join().ok();
+            s2c.join().ok();
+          }
+          _ => {
+            let content_length = client_req.headers.iter()
+                .find(|h| h.name.eq_ignore_ascii_case("Content-Length"))
+                .map(|h| str::from_utf8(h.value).unwrap_or("0"))
+                .unwrap_or("0")
+                .parse::<usize>()
+                .unwrap_or(0);
+
+            let mut buf = vec![0u8; content_length];
+            client_reader.read_exact(&mut buf).unwrap();
+            stream.write_all(&buf).unwrap();
+          }
+        }
       }
     },
     Err(_) => {
       stream.write(build_packet("404", "Not Found", "Not Found").as_bytes()).unwrap();
     }
   }
-
-  stream.flush().unwrap();
 }
 
 fn listen(args: &Args, keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<HashMap<String, String>>>) {
@@ -379,7 +443,7 @@ fn listen(args: &Args, keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<Hash
 
         pool1.execute(move || {
           let addr = stream.peer_addr().unwrap();
-          handle_request(&stream, &keys, &config, &addr.to_string());
+          handle_request(stream, &keys, &config, &addr.to_string());
         });
       }
     });
@@ -390,7 +454,7 @@ fn listen(args: &Args, keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<Hash
           let https_listener = smol::net::TcpListener::bind(&host).await.unwrap();
 
         let mut state = AcmeConfig::new(hosts.clone())
-            .directory_lets_encrypt(false)
+            .directory_lets_encrypt(true)
             .challenge_type(UseChallenge::Http01)
             .cache(DirCache::new("/etc/split/certs"))
             .state();
@@ -435,10 +499,9 @@ fn listen(args: &Args, keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<Hash
                       return;
                     }
                   };
-                  let mut blocking_stream  = BlockingTlsStream { inner: tls };
+                  let blocking_stream  = BlockingTlsStream { inner: tls };
 
-                  handle_request(&mut blocking_stream, &keys, &config, &addr.to_string());
-                  drop(blocking_stream);
+                  handle_request(blocking_stream, &keys, &config, &addr.to_string());
                 }
               })
             });
