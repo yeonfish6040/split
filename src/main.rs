@@ -333,20 +333,8 @@ fn handle_request<S: Read + Write>(mut stream: S, keys: &Arc<RwLock<Vec<String>>
             .unwrap_or("0")
             .parse::<usize>()
             .unwrap_or(0);
-        if content_length != 0 {
-          let mut total = 0;
-          let mut buffer = vec![0u8; content_length];
-          while total < content_length {
-            let read_bytes = client_reader.read(&mut buffer[total..]).unwrap();
-            if read_bytes == 0 {
-              panic!("Unexpected EOF: read {total} of {content_length} bytes");
-            }
-            total += read_bytes;
-          }
-          client_res.extend_from_slice(&buffer);
-        }
 
-        stream.write_all(&client_res).unwrap();
+        stream.write_all(&client_header).unwrap();
         copy(&mut client_reader, &mut stream).unwrap();
         stream.flush().unwrap();
       }
