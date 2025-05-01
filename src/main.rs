@@ -14,6 +14,7 @@ use signal_hook::consts::{SIGHUP, SIGTERM};
 use signal_hook::iterator::Signals;
 use threadpool::ThreadPool;
 use futures::prelude::*;
+use rustls_acme::caches::DirCache;
 use rustls_acme::futures_rustls::LazyConfigAcceptor;
 use rustls_acme::futures_rustls::server::TlsStream;
 use tracing_subscriber::FmtSubscriber;
@@ -400,9 +401,16 @@ fn listen(args: &Args, keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<Hash
       smol::block_on(async {
           let https_listener = smol::net::TcpListener::bind(&host).await.unwrap();
 
-          let mut state = AcmeConfig::new(hosts)
+        let mut state = if std::path::Path::new("/etc/split/certs").exists() {
+          AcmeConfig::new(hosts.clone())
+              .cache(DirCache::new("/etc/split/certs"))
+              .state()
+        } else {
+          AcmeConfig::new(hosts.clone())
               .directory_lets_encrypt(true)
-              .state();
+              .cache(DirCache::new("/etc/split/certs"))
+              .state()
+        };
           let challenge_rustls_config = state.challenge_rustls_config();
           let default_rustls_config = state.default_rustls_config();
 
