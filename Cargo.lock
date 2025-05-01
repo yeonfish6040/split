@@ -1370,7 +1370,7 @@ dependencies = [
 
 [[package]]
 name = "split"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "chrono",
  "clap",
