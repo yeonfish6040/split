@@ -14,6 +14,7 @@ use signal_hook::consts::{SIGHUP, SIGTERM};
 use signal_hook::iterator::Signals;
 use threadpool::ThreadPool;
 use futures::prelude::*;
+use httparse::{Request, Response};
 use rustls_acme::caches::DirCache;
 use rustls_acme::futures_rustls::LazyConfigAcceptor;
 use rustls_acme::futures_rustls::server::TlsStream;
@@ -85,6 +86,23 @@ impl Drop for BlockingTlsStream {
     block_on(self.inner.close()).unwrap()
   }
 }
+
+trait HasHeaders<'a> {
+  fn headers(&self) -> &[httparse::Header<'a>];
+}
+
+impl<'a, 'b> HasHeaders<'a> for Request<'a, 'b> {
+  fn headers(&self) -> &[httparse::Header<'a>] {
+    self.headers
+  }
+}
+
+impl<'a, 'b> HasHeaders<'a> for Response<'a, 'b> {
+  fn headers(&self) -> &[httparse::Header<'a>] {
+    self.headers
+  }
+}
+
 
 // utils
 fn get_pid() -> i32 {
@@ -230,34 +248,112 @@ fn get_config(config_lock: &RwLockReadGuard<HashMap<String, String>>, target: &s
 }
 
 // functionality
-fn handle_request<S: Read + Write + Send + 'static>(mut stream: S, keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<HashMap<String, String>>>, peer_addr: &str) {
+fn transfer_data<'a, Src, Dest, H>(
+  mut client_reader: BufReader<&mut Src>,
+  mut target_stream: Dest,
+  client_header: &Vec<u8>,
+  client_req: &H,
+  target_addr: &str,
+) -> Result<Dest, ()>
+where
+    Src: Read + Write + Send + 'static,
+    Dest: Read + Write + Send + 'static,
+    H: HasHeaders<'a> + Send + Sync,
+{
+  let mut req_type = "";
+  if client_req.headers().iter().any(|h| h.name.eq_ignore_ascii_case("Transfer-Encoding") && str::from_utf8(h.value).unwrap_or("").contains("chunked")) {
+    req_type = "chunked";
+  }
+  if client_req.headers().iter().any(|h| { h.name.eq_ignore_ascii_case("Upgrade") && str::from_utf8(h.value).unwrap_or("").eq_ignore_ascii_case("websocket") }) {
+    req_type = "websocket";
+  }
 
-  let mut header_buf = Vec::new();
-  let mut packet_buf = Vec::new();
+  match req_type {
+    "chunked" => {
+      loop {
+        let mut line = Vec::new();
+        client_reader.read_until(b'\n', &mut line).unwrap();
+        if line.is_empty() { break; }
+        target_stream.write_all(&line).unwrap();
 
-  let success = {
-    let mut reader = BufReader::new(&mut stream);
-    loop {
-      let mut buffer = Vec::new();
-      match reader.read_until(b'\n', &mut buffer) {
-        Ok(0) => break false,
-        Ok(_) => (),
-        Err(_) => break false,
+        let chunk_size_line = String::from_utf8_lossy(&line);
+        if chunk_size_line.trim() == "0" {
+          let mut trailer = Vec::new();
+          client_reader.read_until(b'\n', &mut trailer).unwrap();
+          target_stream.write_all(&trailer).unwrap();
+          break;
+        }
+
+        let chunk_size = usize::from_str_radix(chunk_size_line.trim(), 16).unwrap();
+        let mut chunk = vec![0u8; chunk_size + 2];
+        client_reader.read_exact(&mut chunk).unwrap();
+        target_stream.write_all(&chunk).unwrap();
+        target_stream.flush().unwrap();
       }
-      packet_buf.extend_from_slice(&buffer);
-      header_buf.extend_from_slice(&buffer);
-      if packet_buf.ends_with(b"\r\n\r\n") { break true; }
     }
-  };
+    "websocket" => {
+      let mut backend = TcpStream::connect(target_addr).unwrap();
 
-  if !success {
-    stream.write(build_packet("502", "Bad Gateway", "Upstream closed connection unexpectedly").as_bytes()).unwrap();
-    stream.flush().unwrap();
-    return;
+      backend.write_all(&client_header).unwrap();
+      backend.flush().unwrap();
+
+      use std::sync::{Arc, Mutex};
+
+      let client = Arc::new(Mutex::new(target_stream));      // 프론트
+      let server = Arc::new(Mutex::new(backend));     // 백엔드
+
+      {
+        let client = Arc::clone(&client);
+        let server = Arc::clone(&server);
+        thread::spawn(move || {
+          std::io::copy(&mut *client.lock().unwrap(), &mut *server.lock().unwrap()).ok();
+        })
+      };
+
+      {
+        let client = Arc::clone(&client);
+        let server = Arc::clone(&server);
+        thread::spawn(move || {
+          std::io::copy(&mut *server.lock().unwrap(), &mut *client.lock().unwrap()).ok();
+        })
+      };
+
+      return Err(());
+    }
+    _ => {
+      let content_length = client_req.headers().iter()
+          .find(|h| h.name.eq_ignore_ascii_case("Content-Length"))
+          .map(|h| str::from_utf8(h.value).unwrap_or("0"))
+          .unwrap_or("0")
+          .parse::<usize>()
+          .unwrap_or(0);
+
+      let mut buf = vec![0u8; content_length];
+      client_reader.read_exact(&mut buf).unwrap();
+      target_stream.write_all(&buf).unwrap();
+      target_stream.flush().unwrap();
+    }
+  }
+
+  Ok(target_stream)
+}
+
+fn handle_request<S: Read + Write + Send + 'static>(mut stream: S, keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<HashMap<String, String>>>, peer_addr: &str) {
+  let mut header_buf = Vec::new();
+  let mut reader = BufReader::new(&mut stream);
+
+  loop {
+    let mut buffer = Vec::new();
+    reader.read_until(b'\n', &mut buffer).unwrap();
+    if buffer.is_empty() { panic!("Error: Stream closed before headers complete"); }
+
+    header_buf.extend_from_slice(&buffer);
+
+    if header_buf.ends_with(b"\r\n\r\n") { break };
   }
 
   let mut headers = [httparse::EMPTY_HEADER; 32];
-  let mut req = httparse::Request::new(&mut headers);
+  let mut req = Request::new(&mut headers);
 
   match req.parse(&header_buf) {
       Ok(httparse::Status::Complete(_)) => {}
@@ -275,32 +371,21 @@ fn handle_request<S: Read + Write + Send + 'static>(mut stream: S, keys: &Arc<Rw
       .map(|h| str::from_utf8(h.value).unwrap_or(""))
       .unwrap_or("");
 
-  let content_length = req.headers.iter()
-      .find(|h| h.name.eq_ignore_ascii_case("Content-Length"))
-      .map(|h| str::from_utf8(h.value).unwrap_or("0"))
-      .unwrap_or("0")
-      .parse::<usize>()
-      .unwrap_or(0);
-
   print!("[LOG] {}{}   {} {}{}\n", Local::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(), Local::now().offset().to_string(), peer_addr, host, path);
 
   let target = get_matched_host_key(&keys, &host, &path);
   match &target {
-    Ok(d) => {
+    Ok(host_key) => {
       let config_lock = config.read().unwrap();
-      if get_config(&config_lock, d, "static").eq("1") {
-        stream.write(build_packet(&get_config(&config_lock, d, "res"), "OK", &get_config(&config_lock, d, "target")).as_bytes()).unwrap();
-      }else if get_config(&config_lock, d, "rproxy").eq("1") {
-        if content_length != 0 {
-          let mut reader = BufReader::new(&mut stream);
-          let mut buffer = vec![0u8; content_length];
-          reader.read_exact(&mut buffer).unwrap();
-          packet_buf.extend_from_slice(&buffer);
-        }
+      if get_config(&config_lock, host_key, "static").eq("1") {
+        stream.write(build_packet(&get_config(&config_lock, host_key, "res"), "OK", &get_config(&config_lock, host_key, "target")).as_bytes()).unwrap();
+      }else if get_config(&config_lock, host_key, "rproxy").eq("1") {
 
-        let mut tcp_client = TcpStream::connect(get_config(&config_lock, d, "target")).unwrap();
-        tcp_client.write(&packet_buf).unwrap();
+        let mut tcp_client = TcpStream::connect(get_config(&config_lock, host_key, "target")).unwrap();
+        tcp_client.write(&header_buf).unwrap();
         tcp_client.flush().unwrap();
+
+        tcp_client = transfer_data::<S, TcpStream, Request>(reader, tcp_client, &header_buf, &req, host).unwrap();
 
         // res
         let mut client_header = Vec::new();
@@ -316,7 +401,7 @@ fn handle_request<S: Read + Write + Send + 'static>(mut stream: S, keys: &Arc<Rw
         }
 
         let mut client_headers = [httparse::EMPTY_HEADER; 32];
-        let mut client_req = httparse::Response::new(&mut client_headers);
+        let mut client_req = Response::new(&mut client_headers);
         match client_req.parse(&client_header) {
           Ok(httparse::Status::Complete(_)) => {}
           _ => {
@@ -326,81 +411,10 @@ fn handle_request<S: Read + Write + Send + 'static>(mut stream: S, keys: &Arc<Rw
           },
         }
 
-        let mut req_type = "";
-        if client_req.headers.iter().any(|h| h.name.eq_ignore_ascii_case("Transfer-Encoding") && str::from_utf8(h.value).unwrap_or("").contains("chunked")) {
-          req_type = "chunked";
-        }
-        if req.headers.iter().any(|h| { h.name.eq_ignore_ascii_case("Upgrade") && str::from_utf8(h.value).unwrap_or("").eq_ignore_ascii_case("websocket") }) {
-          req_type = "websocket";
-        }
-
         stream.write_all(&client_header).unwrap();
-
-        match req_type {
-          "chunked" => {
-            loop {
-              let mut line = Vec::new();
-              client_reader.read_until(b'\n', &mut line).unwrap();
-              if line.is_empty() { break; }
-              stream.write_all(&line).unwrap();
-
-              let chunk_size_line = String::from_utf8_lossy(&line);
-              if chunk_size_line.trim() == "0" {
-                let mut trailer = Vec::new();
-                client_reader.read_until(b'\n', &mut trailer).unwrap();
-                stream.write_all(&trailer).unwrap();
-                break;
-              }
-
-              let chunk_size = usize::from_str_radix(chunk_size_line.trim(), 16).unwrap();
-              let mut chunk = vec![0u8; chunk_size + 2];
-              client_reader.read_exact(&mut chunk).unwrap();
-              stream.write_all(&chunk).unwrap();
-            }
-          }
-          "websocket" => {
-            let target_addr = get_config(&config_lock, d, "target");
-            let mut backend = TcpStream::connect(target_addr).unwrap();
-
-            backend.write_all(&packet_buf).unwrap();
-            backend.flush().unwrap();
-
-            use std::sync::{Arc, Mutex};
-
-            let client = Arc::new(Mutex::new(stream));      // 프론트
-            let server = Arc::new(Mutex::new(backend));     // 백엔드
-
-            {
-              let client = Arc::clone(&client);
-              let server = Arc::clone(&server);
-              thread::spawn(move || {
-                std::io::copy(&mut *client.lock().unwrap(), &mut *server.lock().unwrap()).ok();
-              })
-            };
-
-            {
-              let client = Arc::clone(&client);
-              let server = Arc::clone(&server);
-              thread::spawn(move || {
-                std::io::copy(&mut *server.lock().unwrap(), &mut *client.lock().unwrap()).ok();
-              })
-            };
-          }
-          _ => {
-            let content_length = client_req.headers.iter()
-                .find(|h| h.name.eq_ignore_ascii_case("Content-Length"))
-                .map(|h| str::from_utf8(h.value).unwrap_or("0"))
-                .unwrap_or("0")
-                .parse::<usize>()
-                .unwrap_or(0);
-
-            let mut buf = vec![0u8; content_length];
-            client_reader.read_exact(&mut buf).unwrap();
-            stream.write_all(&buf).unwrap();
-          }
-        }
+        transfer_data::<TcpStream, S, Response>(client_reader, stream, &client_header, &client_req, &get_config(&config_lock, host_key, "target")).unwrap();
       }
-    },
+    }
     Err(_) => {
       stream.write(build_packet("404", "Not Found", "Not Found").as_bytes()).unwrap();
     }
