@@ -9,7 +9,7 @@ use chrono::{Local, Utc};
 use clap::{Parser, Subcommand};
 use daemonize::Daemonize;
 use futures::executor::block_on;
-use rustls_acme::{is_tls_alpn_challenge, AcmeConfig, UseChallenge};
+use rustls_acme::{is_tls_alpn_challenge, AcmeConfig, ResolvesServerCertAcme, UseChallenge};
 use signal_hook::consts::{SIGHUP, SIGTERM};
 use signal_hook::iterator::Signals;
 use threadpool::ThreadPool;
@@ -17,7 +17,6 @@ use futures::prelude::*;
 use httparse::{Request, Response};
 use rustls_acme::caches::DirCache;
 use rustls_acme::futures_rustls::LazyConfigAcceptor;
-use rustls_acme::futures_rustls::rustls::ServerConfig;
 use rustls_acme::futures_rustls::server::TlsStream;
 use tracing_subscriber::FmtSubscriber;
 
@@ -339,7 +338,7 @@ where
   Ok(target_stream)
 }
 
-fn handle_request<S: Read + Write + Send + 'static>(mut client_stream: S, keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<HashMap<String, String>>>, peer_addr: &str) {
+fn handle_request<S: Read + Write + Send + 'static>(mut client_stream: S, keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<HashMap<String, String>>>, peer_addr: &str, resolver: Arc<ResolvesServerCertAcme>) {
   let mut client_req_header_buf = Vec::new();
   let mut client_req_reader = BufReader::new(&mut client_stream);
 
@@ -357,15 +356,26 @@ fn handle_request<S: Read + Write + Send + 'static>(mut client_stream: S, keys: 
   let mut client_req = Request::new(&mut client_req_header);
 
   match client_req.parse(&client_req_header_buf) {
-      Ok(httparse::Status::Complete(_)) => {}
-      _ => {
-          client_stream.write(build_packet("400", "Bad Request", "Malformed Request").as_bytes()).unwrap();
-          client_stream.flush().unwrap();
-          return;
-      }
+    Ok(httparse::Status::Complete(_)) => {}
+    _ => {
+      client_stream.write(build_packet("400", "Bad Request", "Malformed Request").as_bytes()).unwrap();
+      client_stream.flush().unwrap();
+      return;
+    }
   }
 
   let path = client_req.path.unwrap_or("");
+  if path.starts_with("/.well-known/acme-challenge/") {
+    let token = path.rsplit('/').next().unwrap_or_default();
+    if let Some(key_auth) = resolver.get_http_01_key_auth(token) {
+      let body = key_auth;
+      let resp = build_packet("200", "OK", &body);
+      client_stream.write_all(resp.as_bytes()).unwrap();
+    } else {
+      client_stream.write_all(build_packet("404", "Not Found", "Not Found").as_bytes()).unwrap();
+    }
+    return;
+  }
 
   let host = client_req.headers.iter()
       .find(|h| h.name.eq_ignore_ascii_case("Host"))
@@ -437,6 +447,15 @@ fn listen(args: &Args, keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<Hash
 
   let pool = ThreadPool::new(args.max);
   {
+    let mut state = AcmeConfig::new(hosts.clone())
+        .directory_lets_encrypt(true)
+        .challenge_type(UseChallenge::Http01)
+        .cache(DirCache::new("/etc/split/certs"))
+        .state();
+
+    let challenge_rustls_config = state.challenge_rustls_config();
+    let default_rustls_config = state.default_rustls_config();
+
     let keys1 = Arc::clone(&keys);
     let keys2 = Arc::clone(&keys);
     let config1 = Arc::clone(&config);
@@ -445,6 +464,7 @@ fn listen(args: &Args, keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<Hash
     let pool2 = ThreadPool::clone(&pool);
 
     let host = String::clone(&args.http_host);
+    let resolver = state.resolver();
     let http_thread = thread::spawn(move || {
       let http_listener = TcpListener::bind(&host).unwrap();
 
@@ -453,26 +473,19 @@ fn listen(args: &Args, keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<Hash
         let keys = Arc::clone(&keys1);
         let config = Arc::clone(&config1);
 
+        let resolver = resolver.clone();
         pool1.execute(move || {
           let addr = stream.peer_addr().unwrap();
-          handle_request(stream, &keys, &config, &addr.to_string());
+          handle_request(stream, &keys, &config, &addr.to_string(), resolver);
         });
       }
     });
 
     let host = String::clone(&args.https_host);
+    let resolver = state.resolver();
     let https_thread = thread::spawn(move || {
       smol::block_on(async {
         let https_listener = smol::net::TcpListener::bind(&host).await.unwrap();
-
-        let mut state = AcmeConfig::new(hosts.clone())
-            .directory_lets_encrypt(true)
-            .challenge_type(UseChallenge::Http01)
-            .cache(DirCache::new("/etc/split/certs"))
-            .state();
-
-        let challenge_rustls_config = state.challenge_rustls_config();
-        let default_rustls_config = state.default_rustls_config();
 
         smol::spawn(async move {
           loop {
@@ -486,39 +499,41 @@ fn listen(args: &Args, keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<Hash
         }).detach();
 
         while let Some(tcp) = https_listener.incoming().next().await {
-            let challenge_rustls_config = challenge_rustls_config.clone();
-            let default_rustls_config = default_rustls_config.clone();
+          let challenge_rustls_config = challenge_rustls_config.clone();
+          let default_rustls_config = default_rustls_config.clone();
 
-            let stream = tcp.unwrap();
-            let addr = stream.peer_addr().unwrap();
+          let stream = tcp.unwrap();
+          let addr = stream.peer_addr().unwrap();
 
-            let keys = Arc::clone(&keys2);
-            let config = Arc::clone(&config2);
+          let keys = Arc::clone(&keys2);
+          let config = Arc::clone(&config2);
 
-            pool2.execute(move || {
-              smol::block_on(async move {
-                let start_handshake = LazyConfigAcceptor::new(Default::default(), stream).await.unwrap();
+          let resolver = resolver.clone();
+          pool2.execute(move || {
+            smol::block_on(async move {
+              let start_handshake = LazyConfigAcceptor::new(Default::default(), stream).await.unwrap();
 
-                if is_tls_alpn_challenge(&start_handshake.client_hello()) {
-                  println!("received TLS-ALPN-01 validation request");
-                  let mut tls = start_handshake.into_stream(challenge_rustls_config).await.unwrap();
-                  tls.close().await.unwrap();
-                } else {
-                  let tls = match start_handshake.into_stream(default_rustls_config).await {
-                    Ok(tls) => tls,
-                    Err(e) => {
-                      println!("TLS handshake failed: {:?}", e);
-                      return;
-                    }
-                  };
-                  let blocking_stream  = BlockingTlsStream { inner: tls };
+              println!("{:?}", &start_handshake.client_hello());
+              if is_tls_alpn_challenge(&start_handshake.client_hello()) {
+                println!("received TLS-ALPN-01 validation request");
+                let mut tls = start_handshake.into_stream(challenge_rustls_config).await.unwrap();
+                tls.close().await.unwrap();
+              } else {
+                let tls = match start_handshake.into_stream(default_rustls_config).await {
+                  Ok(tls) => tls,
+                  Err(e) => {
+                    println!("TLS handshake failed: {:?}", e);
+                    return;
+                  }
+                };
+                let blocking_stream  = BlockingTlsStream { inner: tls };
 
-                  handle_request(blocking_stream, &keys, &config, &addr.to_string());
-                }
-              })
-            });
-          }
-        });
+                handle_request(blocking_stream, &keys, &config, &addr.to_string(), resolver);
+              }
+            })
+          });
+        }
+      });
     });
 
     println!("Listening on {} for http traffic", &args.http_host);
@@ -595,14 +610,14 @@ fn main() {
     Commands::Stop => {
       let pid = get_pid();
       nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), nix::sys::signal::SIGTERM)
-        .unwrap();
+          .unwrap();
       println!("daemon stopped");
     }
 
     Commands::Reload => {
       let pid = get_pid();
       nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), nix::sys::signal::SIGHUP)
-        .unwrap();
+          .unwrap();
       println!("daemon reloaded");
     }
 
