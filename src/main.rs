@@ -9,12 +9,12 @@ use chrono::{Local, Utc};
 use clap::{Parser, Subcommand};
 use daemonize::Daemonize;
 use futures::executor::block_on;
-use rustls_acme::AcmeConfig;
-use rustls_acme::caches::DirCache;
+use rustls_acme::{is_tls_alpn_challenge, AcmeConfig};
 use signal_hook::consts::{SIGHUP, SIGTERM};
 use signal_hook::iterator::Signals;
 use threadpool::ThreadPool;
 use futures::prelude::*;
+use rustls_acme::futures_rustls::LazyConfigAcceptor;
 use rustls_acme::futures_rustls::server::TlsStream;
 use tracing_subscriber::FmtSubscriber;
 
@@ -76,6 +76,12 @@ impl Write for BlockingTlsStream {
 
   fn flush(&mut self) -> std::io::Result<()> {
     block_on(self.inner.flush())
+  }
+}
+
+impl Drop for BlockingTlsStream {
+  fn drop(&mut self) {
+    block_on(self.inner.close()).unwrap()
   }
 }
 
@@ -377,36 +383,57 @@ fn listen(args: &Args, keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<Hash
 
         pool1.execute(move || {
           let addr = stream.peer_addr().unwrap();
-          handle_request(stream, &keys, &config, &addr.to_string());
+          handle_request(&stream, &keys, &config, &addr.to_string());
         });
       }
     });
 
     let host = String::clone(&args.https_host);
     let https_thread = thread::spawn(move || {
-      tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(async {
+      smol::block_on(async {
           let https_listener = smol::net::TcpListener::bind(&host).await.unwrap();
 
-          println!("{:?}", hosts);
-          let mut tls_incoming = AcmeConfig::new(hosts)
-              .cache(DirCache::new("/etc/split/cache"))
-              .directory_lets_encrypt(true)
-              .incoming(https_listener.incoming(), Vec::new());
+          let mut state = AcmeConfig::new(hosts)
+              .directory_lets_encrypt(false)
+              .state();
+          let challenge_rustls_config = state.challenge_rustls_config();
+          let default_rustls_config = state.default_rustls_config();
 
-          while let Some(tls) = tls_incoming.next().await {
-            let tls_stream = tls.unwrap();
+          smol::spawn(async move {
+            loop {
+              match state.next().await.unwrap() {
+                Ok(ok) => println!("event: {:?}", ok),
+                Err(err) => println!("error: {:?}", err),
+              }
+            }
+          }).detach();
+
+        while let Some(tcp) = https_listener.incoming().next().await {
+            let challenge_rustls_config = challenge_rustls_config.clone();
+            let default_rustls_config = default_rustls_config.clone();
+
+            let stream = tcp.unwrap();
+            let addr = stream.peer_addr().unwrap();
 
             let keys = Arc::clone(&keys2);
             let config = Arc::clone(&config2);
 
             pool2.execute(move || {
-              let addr = tls_stream.get_ref().0.peer_addr().unwrap();
-              let blocking_stream = BlockingTlsStream { inner: tls_stream };
-              handle_request(blocking_stream, &keys, &config, &addr.to_string());
+              smol::block_on(async move {
+                let start_handshake = LazyConfigAcceptor::new(Default::default(), stream).await.unwrap();
+
+                if is_tls_alpn_challenge(&start_handshake.client_hello()) {
+                  println!("received TLS-ALPN-01 validation request");
+                  let mut tls = start_handshake.into_stream(challenge_rustls_config).await.unwrap();
+                  tls.close().await.unwrap();
+                } else {
+                  let tls = start_handshake.into_stream(default_rustls_config).await.unwrap();
+                  let mut blocking_stream  = BlockingTlsStream { inner: tls };
+
+                  handle_request(&mut blocking_stream, &keys, &config, &addr.to_string());
+                  drop(blocking_stream);
+                }
+              })
             });
           }
         });
