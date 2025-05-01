@@ -9,7 +9,7 @@ use chrono::{Local, Utc};
 use clap::{Parser, Subcommand};
 use daemonize::Daemonize;
 use futures::executor::block_on;
-use rustls_acme::{is_tls_alpn_challenge, AcmeConfig};
+use rustls_acme::{is_tls_alpn_challenge, AcmeConfig, UseChallenge};
 use signal_hook::consts::{SIGHUP, SIGTERM};
 use signal_hook::iterator::Signals;
 use threadpool::ThreadPool;
@@ -401,27 +401,25 @@ fn listen(args: &Args, keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<Hash
       smol::block_on(async {
           let https_listener = smol::net::TcpListener::bind(&host).await.unwrap();
 
-        let mut state = if std::path::Path::new("/etc/split/certs").exists() {
-          AcmeConfig::new(hosts.clone())
-              .cache(DirCache::new("/etc/split/certs"))
-              .state()
-        } else {
-          AcmeConfig::new(hosts.clone())
-              .directory_lets_encrypt(true)
-              .cache(DirCache::new("/etc/split/certs"))
-              .state()
-        };
-          let challenge_rustls_config = state.challenge_rustls_config();
-          let default_rustls_config = state.default_rustls_config();
+        let mut state = AcmeConfig::new(hosts.clone())
+            .directory_lets_encrypt(true)
+            .challenge_type(UseChallenge::Http01)
+            .cache(DirCache::new("/etc/split/certs"))
+            .state();
 
-          smol::spawn(async move {
-            loop {
-              match state.next().await.unwrap() {
-                Ok(ok) => println!("event: {:?}", ok),
-                Err(err) => println!("error: {:?}", err),
-              }
+        let challenge_rustls_config = state.challenge_rustls_config();
+        let default_rustls_config = state.default_rustls_config();
+
+        smol::spawn(async move {
+          loop {
+            match state.next().await.unwrap() {
+              Ok(ok) => println!("event: {:?}", ok),
+              Err(err) => {
+                println!("error: {:?}", err)
+              },
             }
-          }).detach();
+          }
+        }).detach();
 
         while let Some(tcp) = https_listener.incoming().next().await {
             let challenge_rustls_config = challenge_rustls_config.clone();
@@ -442,7 +440,13 @@ fn listen(args: &Args, keys: &Arc<RwLock<Vec<String>>>, config: &Arc<RwLock<Hash
                   let mut tls = start_handshake.into_stream(challenge_rustls_config).await.unwrap();
                   tls.close().await.unwrap();
                 } else {
-                  let tls = start_handshake.into_stream(default_rustls_config).await.unwrap();
+                  let tls = match start_handshake.into_stream(default_rustls_config).await {
+                    Ok(tls) => tls,
+                    Err(e) => {
+                      println!("TLS handshake failed: {:?}", e);
+                      return;
+                    }
+                  };
                   let mut blocking_stream  = BlockingTlsStream { inner: tls };
 
                   handle_request(&mut blocking_stream, &keys, &config, &addr.to_string());
