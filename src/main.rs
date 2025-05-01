@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+use std::io::{copy, BufRead, BufReader, ErrorKind, Read, Write};
 use httparse;
 use std::net::{TcpListener, TcpStream};
 use std::{str, time};
@@ -346,7 +346,8 @@ fn handle_request<S: Read + Write>(mut stream: S, keys: &Arc<RwLock<Vec<String>>
           client_res.extend_from_slice(&buffer);
         }
 
-        stream.write(&client_res).unwrap();
+        stream.write_all(&client_res).unwrap();
+        copy(&mut client_reader, &mut stream).unwrap();
         stream.flush().unwrap();
       }
     },
