@@ -332,11 +332,8 @@ fn handle_request<S: Read + Write>(mut stream: S, keys: &Arc<RwLock<Vec<String>>
             .parse::<usize>()
             .unwrap_or(0);
 
-        let mut body_buf = vec![0u8; content_length];
-        client_reader.read_exact(&mut body_buf).unwrap();
-
         stream.write_all(&client_header).unwrap();
-        stream.write_all(&body_buf).unwrap();
+        std::io::copy(&mut client_reader, &mut stream).unwrap();
 
         stream.flush().unwrap();
       }
